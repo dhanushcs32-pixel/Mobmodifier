@@ -20,5 +20,6 @@ public class SereneMobModifier {
 
         modContainer.registerConfig(ModConfig.Type.COMMON, MobModifierConfig.SPEC);
         NeoForge.EVENT_BUS.register(EntitySpawnHandler.class);
+        modEventBus.addListener(EntitySpawnHandler::onEntityAttributeModification);
     }
 }
