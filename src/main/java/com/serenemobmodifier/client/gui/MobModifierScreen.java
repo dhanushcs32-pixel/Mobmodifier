@@ -572,7 +572,7 @@ public class MobModifierScreen extends Screen {
         // ── Toggles ──
         cy = renderToggleRow(gfx, mouseX, mouseY, "Hostile to Players", currentEdit.hostile, cx, cy, sliderW, 0);
         cy += 4;
-        cy = renderToggleRow(gfx, mouseX, mouseY, "Target Boats", currentEdit.boats, cx, cy, sliderW, 1);
+        cy = renderToggleRow(gfx, mouseX, mouseY, "Target Boats & Ships", currentEdit.boats, cx, cy, sliderW, 1);
 
         rightContentHeight = (cy + PADDING) - startY;
 

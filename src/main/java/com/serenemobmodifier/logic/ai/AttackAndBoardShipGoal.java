@@ -1,0 +1,588 @@
+package com.serenemobmodifier.logic.ai;
+
+import com.serenemobmodifier.logic.sable.LadderBoardingPoint;
+import com.serenemobmodifier.logic.sable.SableBridge;
+import com.serenemobmodifier.logic.sable.SableShipData;
+import net.minecraft.core.BlockPos;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.sounds.SoundEvents;
+import net.minecraft.util.Mth;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.Mob;
+import net.minecraft.world.entity.ai.attributes.Attributes;
+import net.minecraft.world.entity.ai.goal.Goal;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.entity.vehicle.Boat;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.Vec3;
+
+import java.util.EnumSet;
+import java.util.List;
+
+/**
+ * Advanced AI goal for boat-targeting mobs.
+ *
+ * <p>Directs aquatic and hostile mobs to hunt vanilla boats and actively intercept,
+ * board, or ram assembled Sable / Serene Sailing sub-level ships:
+ * <ul>
+ *   <li><b>Priority A (Ladder Boarding):</b> If the ship has exterior ladders, vines,
+ *       climbable blocks, or low gunwales, the mob intercepts the ladder base,
+ *       hoists up the rungs at climbing velocity onto the deck, and prowls the deck
+ *       to attack players and ship components.</li>
+ *   <li><b>Priority B (Hull Attack &amp; Ramming):</b> When approaching or when no ladders
+ *       are reachable, the mob swims to intercept the waterline hull planks, delivers
+ *       melee attacks with wooden impact sounds every 20 ticks, and applies physical
+ *       rocking impulses to the ship.</li>
+ * </ul>
+ */
+public class AttackAndBoardShipGoal extends Goal {
+
+    public enum Stage {
+        IDLE,
+        APPROACH_BOAT,
+        APPROACH_SHIP_LADDER,
+        CLIMBING_LADDER,
+        ON_DECK,
+        APPROACH_SHIP_HULL,
+        ATTACKING_SHIP_HULL
+    }
+
+    protected final Mob mob;
+    protected final double searchRadius;
+
+    protected Boat targetBoat;
+    protected SableShipData targetShip;
+    protected LadderBoardingPoint targetLadder;
+    protected BlockPos targetHullLocal;
+
+    protected Stage stage = Stage.IDLE;
+    protected int attackCooldown = 0;
+    protected int climbTicks = 0;
+    protected int onDeckTicks = 0;
+
+    public AttackAndBoardShipGoal(Mob mob, double searchRadius) {
+        this.mob = mob;
+        this.searchRadius = searchRadius;
+        this.setFlags(EnumSet.of(Goal.Flag.MOVE, Goal.Flag.LOOK));
+    }
+
+    @Override
+    public boolean canUse() {
+        // If mob has an attack target, check if that target is in a boat or on a ship
+        LivingEntity currentTarget = this.mob.getTarget();
+        if (currentTarget != null) {
+            boolean targetInBoat = currentTarget.getVehicle() instanceof Boat;
+            boolean targetNearMob = this.mob.distanceToSqr(currentTarget) < 36.0;
+            if (!targetInBoat && targetNearMob) {
+                return false;
+            }
+        }
+
+        Vec3 mobPos = this.mob.position();
+
+        // 1. Scan for assembled Sable ships if in ServerLevel
+        SableShipData chosenShip = null;
+        if (this.mob.level() instanceof ServerLevel serverLevel && SableBridge.isSableLoaded()) {
+            List<SableShipData> nearbyShips = SableBridge.findNearbyShips(serverLevel, mobPos, this.searchRadius);
+            if (!nearbyShips.isEmpty()) {
+                // Priority: ships with players aboard, else closest ship
+                double closestDistSq = Double.MAX_VALUE;
+                for (SableShipData ship : nearbyShips) {
+                    AABB bounds = ship.getWorldBounds();
+                    boolean hasPlayers = false;
+                    for (Player player : serverLevel.players()) {
+                        if (bounds.inflate(2.0).contains(player.position())) {
+                            hasPlayers = true;
+                            break;
+                        }
+                    }
+                    double dsq = bounds.distanceToSqr(mobPos);
+                    if (hasPlayers) {
+                        chosenShip = ship;
+                        break;
+                    } else if (dsq < closestDistSq) {
+                        closestDistSq = dsq;
+                        chosenShip = ship;
+                    }
+                }
+            }
+        }
+
+        // 2. Scan for vanilla Boat entities
+        Boat chosenBoat = null;
+        List<Boat> nearbyBoats = this.mob.level().getEntitiesOfClass(
+                Boat.class,
+                this.mob.getBoundingBox().inflate(this.searchRadius),
+                b -> b.isAlive() && !b.isRemoved()
+        );
+        if (!nearbyBoats.isEmpty()) {
+            double closestBoatDistSq = Double.MAX_VALUE;
+            for (Boat boat : nearbyBoats) {
+                double dsq = this.mob.distanceToSqr(boat);
+                if (!boat.getPassengers().isEmpty()) {
+                    chosenBoat = boat;
+                    break;
+                } else if (dsq < closestBoatDistSq) {
+                    closestBoatDistSq = dsq;
+                    chosenBoat = boat;
+                }
+            }
+        }
+
+        // Select best target (prioritizing vehicles with players/passengers)
+        if (chosenShip != null && chosenBoat != null) {
+            if (chosenBoat.getPassengers().isEmpty()) {
+                setupShipTarget(chosenShip);
+                return true;
+            } else {
+                setupBoatTarget(chosenBoat);
+                return true;
+            }
+        } else if (chosenShip != null) {
+            setupShipTarget(chosenShip);
+            return true;
+        } else if (chosenBoat != null) {
+            setupBoatTarget(chosenBoat);
+            return true;
+        }
+
+        return false;
+    }
+
+    private void setupBoatTarget(Boat boat) {
+        this.targetBoat = boat;
+        this.targetShip = null;
+        this.targetLadder = null;
+        this.targetHullLocal = null;
+        this.stage = Stage.APPROACH_BOAT;
+    }
+
+    private void setupShipTarget(SableShipData ship) {
+        this.targetShip = ship;
+        this.targetBoat = null;
+        this.climbTicks = 0;
+        this.onDeckTicks = 0;
+
+        SableShipData.ShipScanResult scan = ship.getScan(this.mob.level().getGameTime());
+
+        // Priority A: Check for ladder boarding points
+        LadderBoardingPoint bestLadder = findClosestBoardingPoint(ship, scan.ladders);
+        if (bestLadder == null) {
+            // Check for low gunwales if no ladder is present
+            bestLadder = findClosestBoardingPoint(ship, scan.lowGunwales);
+        }
+
+        if (bestLadder != null) {
+            this.targetLadder = bestLadder;
+            this.targetHullLocal = null;
+            this.stage = Stage.APPROACH_SHIP_LADDER;
+        } else {
+            // Priority B: Hull ramming / attack
+            this.targetLadder = null;
+            this.targetHullLocal = findClosestHullBlock(ship, scan.waterlineHullPerimeter);
+            this.stage = Stage.APPROACH_SHIP_HULL;
+        }
+    }
+
+    private LadderBoardingPoint findClosestBoardingPoint(SableShipData ship, List<LadderBoardingPoint> points) {
+        if (points == null || points.isEmpty()) return null;
+        LadderBoardingPoint closest = null;
+        double bestDistSq = Double.MAX_VALUE;
+        Vec3 mobPos = this.mob.position();
+        for (LadderBoardingPoint pt : points) {
+            Vec3 frontPos = pt.getFrontWorld(ship);
+            double dsq = mobPos.distanceToSqr(frontPos);
+            if (dsq < bestDistSq) {
+                bestDistSq = dsq;
+                closest = pt;
+            }
+        }
+        return closest;
+    }
+
+    private BlockPos findClosestHullBlock(SableShipData ship, List<BlockPos> hullBlocks) {
+        if (hullBlocks == null || hullBlocks.isEmpty()) return null;
+        BlockPos closest = null;
+        double bestDistSq = Double.MAX_VALUE;
+        Vec3 mobPos = this.mob.position();
+        for (BlockPos hp : hullBlocks) {
+            Vec3 worldPos = ship.transformPosition(Vec3.atCenterOf(hp));
+            double dsq = mobPos.distanceToSqr(worldPos);
+            if (dsq < bestDistSq) {
+                bestDistSq = dsq;
+                closest = hp;
+            }
+        }
+        return closest;
+    }
+
+    @Override
+    public boolean canContinueToUse() {
+        if (this.targetBoat != null) {
+            return this.targetBoat.isAlive()
+                    && !this.targetBoat.isRemoved()
+                    && this.mob.distanceToSqr(this.targetBoat) < (this.searchRadius * this.searchRadius);
+        }
+
+        if (this.targetShip != null) {
+            if (this.targetShip.isRemoved()) return false;
+            double distSq = this.targetShip.getWorldBounds().distanceToSqr(this.mob.position());
+            return distSq < (this.searchRadius * this.searchRadius);
+        }
+
+        return false;
+    }
+
+    @Override
+    public void start() {
+        this.attackCooldown = 0;
+        this.climbTicks = 0;
+        this.onDeckTicks = 0;
+        if (this.mob.isInWater()) {
+            this.mob.setSwimming(true);
+        }
+    }
+
+    @Override
+    public void tick() {
+        if (this.attackCooldown > 0) {
+            this.attackCooldown--;
+        }
+
+        // Dispatch based on active target and current stage
+        if (this.targetBoat != null) {
+            tickVanillaBoat();
+        } else if (this.targetShip != null) {
+            tickSableShip();
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Vanilla Boat Pursuit & Attack
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    private void tickVanillaBoat() {
+        if (this.targetBoat == null) return;
+
+        double dx = this.targetBoat.getX() - this.mob.getX();
+        double dy = (this.targetBoat.getY() - 0.25) - this.mob.getY();
+        double dz = this.targetBoat.getZ() - this.mob.getZ();
+        double distHorizontalSq = dx * dx + dz * dz;
+        double distTotalSq = distHorizontalSq + (dy * dy);
+
+        alignLookAndYaw(dx, dz, distHorizontalSq, new Vec3(this.targetBoat.getX(), this.targetBoat.getY(), this.targetBoat.getZ()));
+
+        if (this.mob.isInWater()) {
+            applyAquaticSwimVelocity(dx, dy, dz, distTotalSq, this.targetBoat.getY() - 0.35);
+        } else {
+            if (this.mob.tickCount % 10 == 0) {
+                this.mob.getNavigation().moveTo(this.targetBoat.getX(), this.targetBoat.getY(), this.targetBoat.getZ(), 1.25);
+            }
+        }
+
+        double reach = (this.mob.getBbWidth() * 1.5) + (this.targetBoat.getBbWidth() / 2.0) + 0.8;
+        if (distTotalSq <= (reach * reach) && this.attackCooldown <= 0) {
+            performVanillaBoatAttack();
+        }
+    }
+
+    private void performVanillaBoatAttack() {
+        this.attackCooldown = 20;
+        this.mob.swing(InteractionHand.MAIN_HAND);
+        this.mob.playSound(SoundEvents.PLAYER_ATTACK_STRONG, 1.0F, 0.8F);
+        this.mob.playSound(SoundEvents.ZOMBIE_ATTACK_WOODEN_DOOR, 0.7F, 1.1F);
+
+        float damage = (float) this.mob.getAttributeValue(Attributes.ATTACK_DAMAGE);
+        if (damage <= 0.0f) damage = 4.0f;
+
+        this.targetBoat.hurt(this.mob.damageSources().mobAttack(this.mob), damage);
+
+        for (Entity passenger : this.targetBoat.getPassengers()) {
+            if (passenger instanceof LivingEntity livingPassenger) {
+                livingPassenger.hurt(this.mob.damageSources().mobAttack(this.mob), damage);
+                livingPassenger.knockback(0.4, this.mob.getX() - livingPassenger.getX(), this.mob.getZ() - livingPassenger.getZ());
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Sable Assembled Ship Pursuit, Boarding & Ramming
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    private void tickSableShip() {
+        if (this.targetShip == null || this.targetShip.isRemoved()) return;
+
+        // Periodic target verification / refresh (every 30 ticks)
+        if (this.mob.tickCount % 30 == 0 && this.stage != Stage.CLIMBING_LADDER && this.stage != Stage.ON_DECK) {
+            SableShipData.ShipScanResult scan = this.targetShip.getScan(this.mob.level().getGameTime());
+            LadderBoardingPoint ladder = findClosestBoardingPoint(this.targetShip, scan.ladders);
+            if (ladder == null) {
+                ladder = findClosestBoardingPoint(this.targetShip, scan.lowGunwales);
+            }
+            if (ladder != null) {
+                this.targetLadder = ladder;
+                this.stage = Stage.APPROACH_SHIP_LADDER;
+            } else if (this.targetHullLocal == null) {
+                this.targetHullLocal = findClosestHullBlock(this.targetShip, scan.waterlineHullPerimeter);
+                this.stage = Stage.APPROACH_SHIP_HULL;
+            }
+        }
+
+        switch (this.stage) {
+            case APPROACH_SHIP_LADDER -> tickApproachShipLadder();
+            case CLIMBING_LADDER     -> tickClimbingLadder();
+            case ON_DECK             -> tickOnDeck();
+            case APPROACH_SHIP_HULL, ATTACKING_SHIP_HULL -> tickApproachOrAttackHull();
+            default -> {}
+        }
+    }
+
+    /**
+     * Priority A1: Navigate/swim toward the base of the ship's boarding ladder.
+     */
+    private void tickApproachShipLadder() {
+        if (this.targetLadder == null) {
+            this.stage = Stage.APPROACH_SHIP_HULL;
+            return;
+        }
+
+        Vec3 frontWorld = this.targetLadder.getFrontWorld(this.targetShip);
+        Vec3 bottomWorld = this.targetLadder.getBottomWorld(this.targetShip);
+
+        double dx = frontWorld.x - this.mob.getX();
+        double dy = (frontWorld.y - 0.2) - this.mob.getY();
+        double dz = frontWorld.z - this.mob.getZ();
+        double distHorizontalSq = dx * dx + dz * dz;
+        double distTotalSq = distHorizontalSq + (dy * dy);
+
+        alignLookAndYaw(dx, dz, distHorizontalSq, frontWorld);
+
+        if (this.mob.isInWater()) {
+            applyAquaticSwimVelocity(dx, dy, dz, distTotalSq, frontWorld.y - 0.1);
+        } else {
+            if (this.mob.tickCount % 10 == 0) {
+                this.mob.getNavigation().moveTo(frontWorld.x, frontWorld.y, frontWorld.z, 1.25);
+            }
+        }
+
+        // Distance check to ladder base (1.75 blocks)
+        double distToFront = this.mob.position().distanceTo(frontWorld);
+        double distToBottom = this.mob.position().distanceTo(bottomWorld);
+        if (Math.min(distToFront, distToBottom) <= 1.75) {
+            this.stage = Stage.CLIMBING_LADDER;
+            this.climbTicks = 0;
+            this.mob.playSound(SoundEvents.LADDER_STEP, 1.0F, 1.0F);
+        }
+    }
+
+    /**
+     * Priority A2: Smoothly hoist the mob up the ladder rungs onto the ship's deck.
+     */
+    private void tickClimbingLadder() {
+        if (this.targetLadder == null || this.targetShip == null) {
+            this.stage = Stage.IDLE;
+            return;
+        }
+
+        this.climbTicks++;
+
+        Vec3 bottomWorld = this.targetLadder.getBottomWorld(this.targetShip);
+        Vec3 topWorld = this.targetLadder.getTopWorld(this.targetShip);
+        double deckWorldY = topWorld.y + 0.5;
+
+        // 1. Face the ladder rungs
+        double dx = bottomWorld.x - this.mob.getX();
+        double dz = bottomWorld.z - this.mob.getZ();
+        float targetYaw = (float) (Math.atan2(dz, dx) * (180.0 / Math.PI)) - 90.0F;
+        this.mob.setYRot(targetYaw);
+        this.mob.yBodyRot = targetYaw;
+        this.mob.yHeadRot = targetYaw;
+        this.mob.getLookControl().setLookAt(bottomWorld.x, this.mob.getEyeY(), bottomWorld.z, 30.0F, 30.0F);
+
+        // 2. Set upward climbing velocity (0.22 blocks/tick) and reset fall distance
+        double vx = Mth.clamp(dx * 0.25, -0.15, 0.15);
+        double vz = Mth.clamp(dz * 0.25, -0.15, 0.15);
+        this.mob.setDeltaMovement(vx, 0.22, vz);
+        this.mob.resetFallDistance();
+        this.mob.fallDistance = 0.0F;
+
+        if (this.mob.isInWater()) {
+            this.mob.setSwimming(false);
+        }
+
+        if (this.climbTicks % 6 == 0) {
+            this.mob.playSound(SoundEvents.LADDER_STEP, 0.8F, 1.0F);
+        }
+
+        // 3. Check if mob reached deck level (topOfLadderWorldY + 0.5)
+        if (this.mob.getY() >= (deckWorldY - 0.25) || this.climbTicks > 120) {
+            Vec3 stepWorld = this.targetLadder.getDeckStepWorld(this.targetShip);
+            double fwdX = stepWorld.x - this.mob.getX();
+            double fwdZ = stepWorld.z - this.mob.getZ();
+
+            // Smooth step forward onto deck
+            this.mob.setDeltaMovement(fwdX * 0.35, 0.18, fwdZ * 0.35);
+            this.mob.setPos(this.mob.getX() + fwdX * 0.2, deckWorldY, this.mob.getZ() + fwdZ * 0.2);
+            this.mob.resetFallDistance();
+            this.mob.fallDistance = 0.0F;
+
+            this.stage = Stage.ON_DECK;
+            this.onDeckTicks = 0;
+            this.mob.playSound(SoundEvents.WOOD_STEP, 1.0F, 1.0F);
+        }
+    }
+
+    /**
+     * Priority A3: Mob is on deck; prowl the moving deck and hunt players or ship components.
+     */
+    private void tickOnDeck() {
+        this.onDeckTicks++;
+
+        // If mob fell off into ocean water below ship bounds, reset to re-approach
+        if (this.mob.isInWater() && this.mob.getY() < (this.targetShip.getWorldBounds().minY + 1.2)) {
+            this.stage = Stage.APPROACH_SHIP_LADDER;
+            return;
+        }
+
+        // Hunt nearby players on or near the vessel
+        Player nearestPlayer = this.mob.level().getNearestPlayer(this.mob, 32.0);
+        if (nearestPlayer != null) {
+            this.mob.setTarget(nearestPlayer);
+            if (this.mob.tickCount % 10 == 0) {
+                this.mob.getNavigation().moveTo(nearestPlayer, 1.25);
+            }
+        } else {
+            // Pathfind across deck toward the ship's deck center or helm
+            Vec3 deckCenter = this.targetShip.getDeckCenterWorld();
+            if (this.mob.tickCount % 20 == 0) {
+                this.mob.getNavigation().moveTo(deckCenter.x, deckCenter.y, deckCenter.z, 1.1);
+            }
+        }
+    }
+
+    /**
+     * Priority B: Intercept and ram the waterline hull planks.
+     */
+    private void tickApproachOrAttackHull() {
+        if (this.targetHullLocal == null) {
+            SableShipData.ShipScanResult scan = this.targetShip.getScan(this.mob.level().getGameTime());
+            this.targetHullLocal = findClosestHullBlock(this.targetShip, scan.waterlineHullPerimeter);
+            if (this.targetHullLocal == null) return;
+        }
+
+        Vec3 hullWorld = this.targetShip.transformPosition(Vec3.atCenterOf(this.targetHullLocal));
+
+        double dx = hullWorld.x - this.mob.getX();
+        double dy = (hullWorld.y - 0.2) - this.mob.getY();
+        double dz = hullWorld.z - this.mob.getZ();
+        double distHorizontalSq = dx * dx + dz * dz;
+        double distTotalSq = distHorizontalSq + (dy * dy);
+
+        alignLookAndYaw(dx, dz, distHorizontalSq, hullWorld);
+
+        if (this.mob.isInWater()) {
+            applyAquaticSwimVelocity(dx, dy, dz, distTotalSq, hullWorld.y - 0.2);
+        } else {
+            if (this.mob.tickCount % 10 == 0) {
+                this.mob.getNavigation().moveTo(hullWorld.x, hullWorld.y, hullWorld.z, 1.25);
+            }
+        }
+
+        // Melee reach check (2.5 blocks)
+        double reach = (this.mob.getBbWidth() * 1.5) + 1.3;
+        double distToHull = this.mob.position().distanceTo(hullWorld);
+
+        if (distToHull <= Math.max(reach, 2.5)) {
+            this.stage = Stage.ATTACKING_SHIP_HULL;
+            if (this.attackCooldown <= 0) {
+                performShipHullAttack(hullWorld);
+            }
+        } else {
+            this.stage = Stage.APPROACH_SHIP_HULL;
+        }
+    }
+
+    private void performShipHullAttack(Vec3 hitPos) {
+        this.attackCooldown = 20; // 20 ticks = 1 attack per second
+        this.mob.swing(InteractionHand.MAIN_HAND);
+
+        // Play authentic wooden hull impact sounds
+        this.mob.playSound(SoundEvents.ZOMBIE_ATTACK_WOODEN_DOOR, 1.0F, 0.9F + (this.mob.getRandom().nextFloat() * 0.2F));
+        this.mob.playSound(SoundEvents.PLAYER_ATTACK_STRONG, 0.8F, 0.8F);
+
+        float damage = (float) this.mob.getAttributeValue(Attributes.ATTACK_DAMAGE);
+        if (damage <= 0.0f) damage = 4.0f;
+
+        // Apply physical knock and rocking impulse to the assembled ship contraption
+        Vec3 dir = hitPos.subtract(this.mob.position()).normalize();
+        double impulseMag = Math.max(damage * 350.0, 1200.0);
+        Vec3 impulse = new Vec3(dir.x * impulseMag, 300.0, dir.z * impulseMag);
+        SableBridge.applyImpulseAtPoint(this.targetShip.subLevel(), hitPos, impulse);
+
+        // Damage any players within close reach of the hull impact
+        AABB impactZone = new AABB(hitPos.x - 2.5, hitPos.y - 2.0, hitPos.z - 2.5,
+                hitPos.x + 2.5, hitPos.y + 2.5, hitPos.z + 2.5);
+        List<Player> nearbyPlayers = this.mob.level().getEntitiesOfClass(Player.class, impactZone);
+        for (Player p : nearbyPlayers) {
+            p.hurt(this.mob.damageSources().mobAttack(this.mob), damage);
+            p.knockback(0.35, this.mob.getX() - p.getX(), this.mob.getZ() - p.getZ());
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Movement & Look Helpers
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    private void alignLookAndYaw(double dx, double dz, double distHorizontalSq, Vec3 targetPos) {
+        if (distHorizontalSq > 0.05) {
+            float targetYaw = (float) (Math.atan2(dz, dx) * (180.0 / Math.PI)) - 90.0F;
+            this.mob.setYRot(targetYaw);
+            this.mob.yBodyRot = targetYaw;
+            this.mob.yHeadRot = targetYaw;
+        }
+        this.mob.getLookControl().setLookAt(targetPos.x, targetPos.y, targetPos.z, 30.0F, 30.0F);
+    }
+
+    private void applyAquaticSwimVelocity(double dx, double dy, double dz, double distTotalSq, double clampMaxY) {
+        this.mob.setSwimming(true);
+
+        if (distTotalSq > 0.4) {
+            double speedAttr = this.mob.getAttributeValue(Attributes.MOVEMENT_SPEED);
+            double swimSpeed = Math.max(speedAttr * 1.6, 0.38);
+
+            double dist = Math.sqrt(distTotalSq);
+            double dirX = dx / dist;
+            double dirY = dy / dist;
+            double dirZ = dz / dist;
+
+            // Clamp upward swim velocity near waterline to prevent dolphin-hopping above water
+            if (this.mob.getY() >= clampMaxY && dirY > 0) {
+                dirY = 0.0;
+            }
+
+            Vec3 currentMotion = this.mob.getDeltaMovement();
+            double targetVx = dirX * swimSpeed;
+            double targetVy = dirY * swimSpeed;
+            double targetVz = dirZ * swimSpeed;
+
+            // Smooth velocity integration (0.35 lerp factor)
+            this.mob.setDeltaMovement(
+                    currentMotion.x + (targetVx - currentMotion.x) * 0.35,
+                    currentMotion.y + (targetVy - currentMotion.y) * 0.35,
+                    currentMotion.z + (targetVz - currentMotion.z) * 0.35
+            );
+        }
+    }
+
+    @Override
+    public void stop() {
+        this.targetBoat = null;
+        this.targetShip = null;
+        this.targetLadder = null;
+        this.targetHullLocal = null;
+        this.stage = Stage.IDLE;
+        this.mob.getNavigation().stop();
+    }
+}

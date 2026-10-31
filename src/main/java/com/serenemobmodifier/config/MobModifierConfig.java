@@ -37,6 +37,7 @@ public class MobModifierConfig {
         MODIFIER_RULES = builder
                 .comment("Entity modification rules formatted as:",
                         "entity_id|scale_multiplier|health_multiplier|damage_multiplier|speed_multiplier|follow_range|make_hostile_to_players|target_boats",
+                        "When target_boats is true, mobs hunt vanilla boats and intercept, ladder-board, or ram assembled Sable / Serene Sailing ships.",
                         "Wildcards like 'mythsofthesea:*' are supported.")
                 .defineListAllowEmpty(
                         "rules",
