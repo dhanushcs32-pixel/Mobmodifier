@@ -23,3 +23,10 @@ versionRange="[1.21.1, 1.21.2)"
 ordering="NONE"
 side="BOTH"
 
+[[dependencies.${mod_id}]]
+modId="sable"
+type="optional"
+versionRange="[2.0.0,)"
+ordering="NONE"
+side="BOTH"
+
