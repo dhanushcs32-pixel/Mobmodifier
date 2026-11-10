@@ -242,6 +242,8 @@ public class SableBridge {
                     mBodyApplyImpulse.invoke(body, hitPos, impulse);
                 }
             }
-        } catch (Throwable ignored) {}
+        } catch (Throwable t) {
+            SereneMobModifier.LOGGER.debug("[SereneMobModifier] Error applying impulse to Sable ship: {}", t.getMessage());
+        }
     }
 }

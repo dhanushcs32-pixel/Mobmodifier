@@ -65,8 +65,19 @@ public final class NetworkRegistration {
             MobModifierConfig.updateRule(entityId, ruleString);
             MobModifierConfig.saveToDisk();
 
+            // Live-refresh matching loaded entities across all levels
+            if (serverPlayer.getServer() != null) {
+                for (net.minecraft.server.level.ServerLevel level : serverPlayer.getServer().getAllLevels()) {
+                    for (net.minecraft.world.entity.Entity entity : level.getAllEntities()) {
+                        if (entity instanceof net.minecraft.world.entity.LivingEntity living && living.isAlive()) {
+                            com.serenemobmodifier.logic.MobModifierApplier.applyMatchingRules(living);
+                        }
+                    }
+                }
+            }
+
             serverPlayer.sendSystemMessage(
-                    Component.literal("§a[SereneMobModifier] Rule updated for: " + entityId)
+                    Component.literal("§a[SereneMobModifier] Rule updated and applied for: " + entityId)
             );
             SereneMobModifier.LOGGER.info("[SereneMobModifier] Rule updated by {}: {}",
                     serverPlayer.getName().getString(), ruleString);

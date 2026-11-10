@@ -159,6 +159,14 @@ public class AttackAndBoardShipGoal extends Goal {
         this.stage = Stage.APPROACH_BOAT;
     }
 
+    public static boolean canMobClimbLadders(Mob mob) {
+        if (mob instanceof net.minecraft.world.entity.animal.Squid) return false;
+        if (mob instanceof net.minecraft.world.entity.animal.WaterAnimal && !(mob instanceof net.minecraft.world.entity.animal.Dolphin) && !(mob instanceof net.minecraft.world.entity.animal.Turtle)) return false;
+        if (mob instanceof net.minecraft.world.entity.animal.AbstractFish) return false;
+        if (mob instanceof net.minecraft.world.entity.monster.Guardian) return false;
+        return true;
+    }
+
     private void setupShipTarget(SableShipData ship) {
         this.targetShip = ship;
         this.targetBoat = null;
@@ -167,11 +175,14 @@ public class AttackAndBoardShipGoal extends Goal {
 
         SableShipData.ShipScanResult scan = ship.getScan(this.mob.level().getGameTime());
 
-        // Priority A: Check for ladder boarding points
-        LadderBoardingPoint bestLadder = findClosestBoardingPoint(ship, scan.ladders);
-        if (bestLadder == null) {
-            // Check for low gunwales if no ladder is present
-            bestLadder = findClosestBoardingPoint(ship, scan.lowGunwales);
+        // Priority A: Check for ladder boarding points (only for land/climbing-capable mobs)
+        LadderBoardingPoint bestLadder = null;
+        if (canMobClimbLadders(this.mob)) {
+            bestLadder = findClosestBoardingPoint(ship, scan.ladders);
+            if (bestLadder == null) {
+                // Check for low gunwales if no ladder is present
+                bestLadder = findClosestBoardingPoint(ship, scan.lowGunwales);
+            }
         }
 
         if (bestLadder != null) {
@@ -317,9 +328,12 @@ public class AttackAndBoardShipGoal extends Goal {
         // Periodic target verification / refresh (every 30 ticks)
         if (this.mob.tickCount % 30 == 0 && this.stage != Stage.CLIMBING_LADDER && this.stage != Stage.ON_DECK) {
             SableShipData.ShipScanResult scan = this.targetShip.getScan(this.mob.level().getGameTime());
-            LadderBoardingPoint ladder = findClosestBoardingPoint(this.targetShip, scan.ladders);
-            if (ladder == null) {
-                ladder = findClosestBoardingPoint(this.targetShip, scan.lowGunwales);
+            LadderBoardingPoint ladder = null;
+            if (canMobClimbLadders(this.mob)) {
+                ladder = findClosestBoardingPoint(this.targetShip, scan.ladders);
+                if (ladder == null) {
+                    ladder = findClosestBoardingPoint(this.targetShip, scan.lowGunwales);
+                }
             }
             if (ladder != null) {
                 this.targetLadder = ladder;
@@ -343,7 +357,7 @@ public class AttackAndBoardShipGoal extends Goal {
      * Priority A1: Navigate/swim toward the base of the ship's boarding ladder.
      */
     private void tickApproachShipLadder() {
-        if (this.targetLadder == null) {
+        if (this.targetLadder == null || !canMobClimbLadders(this.mob)) {
             this.stage = Stage.APPROACH_SHIP_HULL;
             return;
         }
@@ -381,8 +395,8 @@ public class AttackAndBoardShipGoal extends Goal {
      * Priority A2: Smoothly hoist the mob up the ladder rungs onto the ship's deck.
      */
     private void tickClimbingLadder() {
-        if (this.targetLadder == null || this.targetShip == null) {
-            this.stage = Stage.IDLE;
+        if (this.targetLadder == null || this.targetShip == null || !canMobClimbLadders(this.mob)) {
+            this.stage = Stage.APPROACH_SHIP_HULL;
             return;
         }
 
@@ -546,10 +560,22 @@ public class AttackAndBoardShipGoal extends Goal {
     }
 
     private void applyAquaticSwimVelocity(double dx, double dy, double dz, double distTotalSq, double clampMaxY) {
-        this.mob.setSwimming(true);
+        if (!this.mob.isInWater()) {
+            return;
+        }
+
+        if (this.mob.isNoGravity()) {
+            this.mob.setNoGravity(false);
+        }
+
+        if (this.mob.canBreatheUnderwater() || this.mob.isSwimming()) {
+            this.mob.setSwimming(true);
+        }
 
         if (distTotalSq > 0.4) {
-            double speedAttr = this.mob.getAttributeValue(Attributes.MOVEMENT_SPEED);
+            double speedAttr = this.mob.getAttribute(Attributes.MOVEMENT_SPEED) != null
+                    ? this.mob.getAttributeValue(Attributes.MOVEMENT_SPEED)
+                    : 0.25;
             double swimSpeed = Math.max(speedAttr * 1.6, 0.38);
 
             double dist = Math.sqrt(distTotalSq);
@@ -567,10 +593,18 @@ public class AttackAndBoardShipGoal extends Goal {
             double targetVy = dirY * swimSpeed;
             double targetVz = dirZ * swimSpeed;
 
-            // Smooth velocity integration (0.35 lerp factor)
+            // When mob is at/above waterline and descending, do NOT lerp targetVy=0 which halts gravity
+            double newVy;
+            if (this.mob.getY() >= clampMaxY && currentMotion.y <= 0) {
+                newVy = currentMotion.y; // Preserve natural downward gravity in wave zones
+            } else {
+                newVy = currentMotion.y + (targetVy - currentMotion.y) * 0.35;
+            }
+
+            // Smooth velocity integration
             this.mob.setDeltaMovement(
                     currentMotion.x + (targetVx - currentMotion.x) * 0.35,
-                    currentMotion.y + (targetVy - currentMotion.y) * 0.35,
+                    newVy,
                     currentMotion.z + (targetVz - currentMotion.z) * 0.35
             );
         }
@@ -584,5 +618,8 @@ public class AttackAndBoardShipGoal extends Goal {
         this.targetHullLocal = null;
         this.stage = Stage.IDLE;
         this.mob.getNavigation().stop();
+        if (this.mob.isNoGravity()) {
+            this.mob.setNoGravity(false);
+        }
     }
 }
