@@ -19,6 +19,12 @@ public class SableBridge {
 
     private static final boolean SABLE_LOADED;
 
+    /**
+     * One {@link SableShipData} per sub-level so the expensive block scan cache is shared by every
+     * mob targeting the same ship, instead of each canUse() poll building a fresh (cache-less) instance.
+     */
+    private static final Map<UUID, SableShipData> SHIP_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+
     private static Method mGetContainer;
     private static Method mGetAllSubLevels;
     private static Method mIsRemoved;
@@ -30,6 +36,7 @@ public class SableBridge {
 
     private static Method mTransformPos;
     private static Method mTransformPosInv;
+    private static Method mTransformNormalInv;
 
     private static Method mPlotGetBox;
     private static Method mBox3iMinX, mBox3iMinY, mBox3iMinZ, mBox3iMaxX, mBox3iMaxY, mBox3iMaxZ;
@@ -83,6 +90,11 @@ public class SableBridge {
 
                 mTransformPos = pose3dcClass.getMethod("transformPosition", Vec3.class);
                 mTransformPosInv = pose3dcClass.getMethod("transformPositionInverse", Vec3.class);
+                try {
+                    mTransformNormalInv = pose3dcClass.getMethod("transformNormalInverse", Vec3.class);
+                } catch (Throwable ignored) {
+                    // Optional: without it ship impulses are skipped instead of being applied in the wrong space.
+                }
 
                 mPlotGetBox = levelPlotClass.getMethod("getBoundingBox");
 
@@ -117,8 +129,22 @@ public class SableBridge {
         SABLE_LOADED = loaded;
     }
 
+    private static final Set<String> WARNED = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /** Logs a bridge failure once per call site; these used to be swallowed silently, hiding Sable API drift. */
+    private static void warnOnce(String where, Throwable t) {
+        if (WARNED.add(where)) {
+            SereneMobModifier.LOGGER.warn("[SereneMobModifier] Sable bridge call failed in {} (further failures suppressed): {}", where, String.valueOf(t));
+        }
+    }
+
     public static boolean isSableLoaded() {
         return SABLE_LOADED;
+    }
+
+    /** Releases cached ship data, e.g. when the server stops, so sub-levels are not retained across worlds. */
+    public static void clearCache() {
+        SHIP_CACHE.clear();
     }
 
     public static List<SableShipData> findNearbyShips(ServerLevel level, Vec3 center, double searchRadius) {
@@ -148,14 +174,23 @@ public class SableBridge {
                 double distSq = aabb.distanceToSqr(center);
                 if (distSq <= radiusSq) {
                     UUID id = (UUID) mGetUniqueId.invoke(subLevel);
-                    Level subLevelWorld = (Level) mGetLevel.invoke(subLevel);
-                    Object poseObj = mLogicalPose.invoke(subLevel);
-                    Object plotObj = mGetPlot.invoke(subLevel);
-                    result.add(new SableShipData(subLevel, id, subLevelWorld, aabb, poseObj, plotObj));
+                    SableShipData data = id != null ? SHIP_CACHE.get(id) : null;
+                    if (data == null || data.subLevel() != subLevel) {
+                        Level subLevelWorld = (Level) mGetLevel.invoke(subLevel);
+                        Object poseObj = mLogicalPose.invoke(subLevel);
+                        Object plotObj = mGetPlot.invoke(subLevel);
+                        data = new SableShipData(subLevel, id, subLevelWorld, aabb, poseObj, plotObj);
+                        if (id != null) SHIP_CACHE.put(id, data);
+                    }
+                    result.add(data);
                 }
             }
+
+            // Drop entries for ships that no longer exist so the cache cannot leak sub-levels.
+            SHIP_CACHE.values().removeIf(d -> isSubLevelRemoved(d.subLevel()));
             return result;
         } catch (Throwable t) {
+            warnOnce("findNearbyShips", t);
             return Collections.emptyList();
         }
     }
@@ -174,7 +209,34 @@ public class SableBridge {
         try {
             return (Vec3) mTransformPos.invoke(poseObj, localPos);
         } catch (Throwable t) {
+            // Falling back to the local position means plot-space coordinates leak into world-space maths.
+            warnOnce("transformPosition", t);
             return localPos;
+        }
+    }
+
+    /**
+     * Rotates a world-space direction (impulse, normal) into the sub-level's local frame.
+     * Returns {@code null} when the transform is unavailable so callers can skip the operation.
+     */
+    public static Vec3 transformNormalInverse(Object poseObj, Vec3 worldDir) {
+        if (poseObj == null || mTransformNormalInv == null) return null;
+        try {
+            return (Vec3) mTransformNormalInv.invoke(poseObj, worldDir);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * Returns the sub-level's current (live) logical pose object, or {@code null}.
+     */
+    public static Object getLogicalPose(Object subLevel) {
+        if (!SABLE_LOADED || subLevel == null || mLogicalPose == null) return null;
+        try {
+            return mLogicalPose.invoke(subLevel);
+        } catch (Throwable t) {
+            return null;
         }
     }
 
@@ -183,6 +245,7 @@ public class SableBridge {
         try {
             return (Vec3) mTransformPosInv.invoke(poseObj, worldPos);
         } catch (Throwable t) {
+            warnOnce("transformPositionInverse", t);
             return worldPos;
         }
     }
@@ -207,6 +270,7 @@ public class SableBridge {
             double maxZ = (double) mBox3dMaxZ.invoke(boxObj);
             return new AABB(minX, minY, minZ, maxX, maxY, maxZ);
         } catch (Throwable t) {
+            warnOnce("getBoundingBox", t);
             return null;
         }
     }
@@ -230,16 +294,20 @@ public class SableBridge {
     }
 
     /**
-     * Applies a physical contact impulse to an assembled Sable ship at a specific world coordinate.
+     * Applies a physical contact impulse to an assembled Sable ship.
+     *
+     * <p>Sable's {@code RigidBodyHandle#applyImpulseAtPoint} works in the sub-level's own space:
+     * {@code localPos} is a plot-local position and {@code localImpulse} is expressed in the
+     * local frame (callers inside Sable convert with {@code transformNormalInverse}).</p>
      */
-    public static void applyImpulseAtPoint(Object subLevel, Vec3 hitPos, Vec3 impulse) {
+    public static void applyImpulseAtPoint(Object subLevel, Vec3 localPos, Vec3 localImpulse) {
         if (!SABLE_LOADED || subLevel == null || mBodyOf == null || mBodyApplyImpulse == null) return;
         try {
             Object body = mBodyOf.invoke(null, subLevel);
             if (body != null) {
                 Boolean valid = (Boolean) mBodyIsValid.invoke(body);
                 if (Boolean.TRUE.equals(valid)) {
-                    mBodyApplyImpulse.invoke(body, hitPos, impulse);
+                    mBodyApplyImpulse.invoke(body, localPos, localImpulse);
                 }
             }
         } catch (Throwable t) {

@@ -6,9 +6,13 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
+import net.neoforged.neoforge.network.PacketDistributor;
 import net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent;
 import net.neoforged.neoforge.network.registration.PayloadRegistrar;
 import net.neoforged.neoforge.network.handling.IPayloadContext;
+
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Registers the {@link UpdateMobRulePayload} with NeoForge's payload handler system and
@@ -29,7 +33,40 @@ public final class NetworkRegistration {
                 NetworkRegistration::handleUpdateMobRule
         );
 
-        SereneMobModifier.LOGGER.debug("[SereneMobModifier] Registered network payload: update_mob_rule");
+        registrar.playToClient(
+                SyncMobRulesPayload.TYPE,
+                SyncMobRulesPayload.STREAM_CODEC,
+                NetworkRegistration::handleSyncMobRules
+        );
+
+        SereneMobModifier.LOGGER.debug("[SereneMobModifier] Registered network payloads: update_mob_rule, sync_mob_rules");
+    }
+
+    /** Builds a payload holding the server's current rule list. */
+    public static SyncMobRulesPayload currentRulesPayload() {
+        List<String> out = new ArrayList<>();
+        List<?> configured = MobModifierConfig.MODIFIER_RULES.get();
+        if (configured != null) {
+            for (Object rule : configured) {
+                out.add(String.valueOf(rule));
+            }
+        }
+        return new SyncMobRulesPayload(out);
+    }
+
+    /** Sends the current rules to one player (used on login). */
+    public static void syncRulesTo(ServerPlayer player) {
+        PacketDistributor.sendToPlayer(player, currentRulesPayload());
+    }
+
+    /** Sends the current rules to every connected player (used after a rule changes). */
+    public static void syncRulesToAll() {
+        PacketDistributor.sendToAllPlayers(currentRulesPayload());
+    }
+
+    /** Client-side handler: remember the server's rules so the GUI can show them. */
+    private static void handleSyncMobRules(SyncMobRulesPayload payload, IPayloadContext context) {
+        context.enqueueWork(() -> ClientRuleCache.set(payload.rules()));
     }
 
     /**
@@ -40,9 +77,12 @@ public final class NetworkRegistration {
         context.enqueueWork(() -> {
             if (!(context.player() instanceof ServerPlayer serverPlayer)) return;
 
-            // Permission check: OP level 2+ or singleplayer
-            boolean isSinglePlayer = serverPlayer.getServer() != null && serverPlayer.getServer().isSingleplayer();
-            if (!isSinglePlayer && !serverPlayer.hasPermissions(2)) {
+            // Permission check: OP level 2+, or the owner of a singleplayer/LAN world.
+            // MinecraftServer#isSingleplayer() is true for the whole integrated server, including
+            // guests who join after "Open to LAN", so it must not be used to grant access.
+            boolean isWorldOwner = serverPlayer.getServer() != null
+                    && serverPlayer.getServer().isSingleplayerOwner(serverPlayer.getGameProfile());
+            if (!isWorldOwner && !serverPlayer.hasPermissions(2)) {
                 serverPlayer.sendSystemMessage(
                         Component.literal("§c[SereneMobModifier] You do not have permission to modify mob rules.")
                 );
@@ -52,9 +92,13 @@ public final class NetworkRegistration {
             }
 
             String ruleString = payload.ruleString();
-            if (ruleString == null || !ruleString.contains("|")) {
-                SereneMobModifier.LOGGER.warn("[SereneMobModifier] Received malformed rule string from {}: {}",
-                        serverPlayer.getName().getString(), ruleString);
+            String problem = MobModifierConfig.validateRule(ruleString);
+            if (problem != null) {
+                SereneMobModifier.LOGGER.warn("[SereneMobModifier] Rejected rule from {} ({}): {}",
+                        serverPlayer.getName().getString(), problem, ruleString);
+                serverPlayer.sendSystemMessage(
+                        Component.literal("§c[SereneMobModifier] Rule rejected: " + problem)
+                );
                 return;
             }
 
@@ -65,12 +109,15 @@ public final class NetworkRegistration {
             MobModifierConfig.updateRule(entityId, ruleString);
             MobModifierConfig.saveToDisk();
 
+            // Keep every client's GUI in step with the server's rules
+            syncRulesToAll();
+
             // Live-refresh matching loaded entities across all levels
             if (serverPlayer.getServer() != null) {
                 for (net.minecraft.server.level.ServerLevel level : serverPlayer.getServer().getAllLevels()) {
                     for (net.minecraft.world.entity.Entity entity : level.getAllEntities()) {
                         if (entity instanceof net.minecraft.world.entity.LivingEntity living && living.isAlive()) {
-                            com.serenemobmodifier.logic.MobModifierApplier.applyMatchingRules(living);
+                            com.serenemobmodifier.logic.MobModifierApplier.refreshEntity(living);
                         }
                     }
                 }

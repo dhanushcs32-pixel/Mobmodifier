@@ -1,6 +1,8 @@
 package com.serenemobmodifier.config;
 
 import com.serenemobmodifier.SereneMobModifier;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.ResourceLocation;
 import net.neoforged.neoforge.common.ModConfigSpec;
 
 import java.util.ArrayList;
@@ -51,6 +53,71 @@ public class MobModifierConfig {
 
         builder.pop();
         SPEC = builder.build();
+    }
+
+    /**
+     * Strictly validates a rule string received from a client before it is stored.
+     *
+     * <p>This is intentionally <em>not</em> used as the config-file validator: when one list element fails
+     * validation NeoForge resets the entire list to its defaults, so a single typo in a hand-edited file
+     * would wipe every rule. Hand-edited bad rules are instead skipped (and reported once) at apply time.</p>
+     *
+     * @return {@code null} if the rule is acceptable, otherwise a human-readable reason
+     */
+    public static String validateRule(String rule) {
+        if (rule == null || rule.isEmpty() || rule.length() > 512) {
+            return "rule is empty or longer than 512 characters";
+        }
+        String[] t = rule.split("\\|", -1);
+        if (t.length < 8 || t.length > 9) {
+            return "expected 8 or 9 '|'-separated fields but found " + t.length;
+        }
+
+        String id = t[0].trim();
+        if (id.endsWith(":*")) {
+            String namespace = id.substring(0, id.length() - 2);
+            if (namespace.isEmpty() || !ResourceLocation.isValidNamespace(namespace)) {
+                return "invalid namespace wildcard '" + id + "'";
+            }
+        } else {
+            ResourceLocation rl = ResourceLocation.tryParse(id);
+            if (rl == null || !BuiltInRegistries.ENTITY_TYPE.containsKey(rl)) {
+                return "unknown entity type '" + id + "'";
+            }
+        }
+
+        String[] names = {"scale", "health", "damage", "speed", "follow range"};
+        double[] maxes = {16.0, 1000.0, 1000.0, 1000.0, 2048.0};
+        for (int i = 0; i < names.length; i++) {
+            double v;
+            try {
+                v = Double.parseDouble(t[i + 1].trim());
+            } catch (NumberFormatException e) {
+                return names[i] + " is not a number: '" + t[i + 1].trim() + "'";
+            }
+            if (!Double.isFinite(v) || v <= 0.0 || v > maxes[i]) {
+                return names[i] + " must be greater than 0 and at most " + maxes[i];
+            }
+        }
+
+        for (int i = 6; i <= 7; i++) {
+            String b = t[i].trim();
+            if (!b.equalsIgnoreCase("true") && !b.equalsIgnoreCase("false")) {
+                return "field " + (i + 1) + " must be true or false but was '" + b + "'";
+            }
+        }
+
+        if (t.length == 9) {
+            try {
+                double kb = Double.parseDouble(t[8].trim());
+                if (!Double.isFinite(kb) || kb < 0.0 || kb > 1.0) {
+                    return "knockback resistance must be between 0 and 1";
+                }
+            } catch (NumberFormatException e) {
+                return "knockback resistance is not a number: '" + t[8].trim() + "'";
+            }
+        }
+        return null;
     }
 
     /**

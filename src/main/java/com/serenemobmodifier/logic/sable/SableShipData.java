@@ -6,6 +6,8 @@ import net.minecraft.tags.BlockTags;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.HorizontalDirectionalBlock;
+import net.minecraft.world.level.block.VineBlock;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
@@ -20,8 +22,9 @@ public class SableShipData {
     private final Object subLevel;
     private final UUID id;
     private final Level subLevelWorld;
-    private final AABB worldBounds;
-    private final Object poseObj;
+    private AABB worldBounds;
+    private Object poseObj;
+    private long liveTick = Long.MIN_VALUE;
     private final Object plotObj;
 
     private ShipScanResult cachedScan;
@@ -48,8 +51,25 @@ public class SableShipData {
         return this.subLevelWorld;
     }
 
+    /**
+     * Current world-space bounds of the ship. Refreshed at most once per game tick because the ship moves;
+     * the bounds captured at construction time would otherwise go stale while a mob is chasing it.
+     */
     public AABB getWorldBounds() {
+        refreshLive();
         return this.worldBounds;
+    }
+
+    private void refreshLive() {
+        if (this.subLevelWorld == null) return;
+        long now = this.subLevelWorld.getGameTime();
+        if (now == this.liveTick) return;
+        this.liveTick = now;
+
+        AABB bounds = SableBridge.getBoundingBox(this.subLevel);
+        if (bounds != null) this.worldBounds = bounds;
+        Object pose = SableBridge.getLogicalPose(this.subLevel);
+        if (pose != null) this.poseObj = pose;
     }
 
     public boolean isRemoved() {
@@ -57,11 +77,19 @@ public class SableShipData {
     }
 
     public Vec3 transformPosition(Vec3 localPos) {
+        refreshLive();
         return SableBridge.transformPosition(this.poseObj, localPos);
     }
 
     public Vec3 transformPositionInverse(Vec3 worldPos) {
+        refreshLive();
         return SableBridge.transformPositionInverse(this.poseObj, worldPos);
+    }
+
+    /** Converts a world-space direction into the ship's local frame, or {@code null} if unavailable. */
+    public Vec3 transformNormalInverse(Vec3 worldDir) {
+        refreshLive();
+        return SableBridge.transformNormalInverse(this.poseObj, worldDir);
     }
 
     public Vec3 getDeckCenterWorld() {
@@ -89,6 +117,7 @@ public class SableShipData {
         List<LadderBoardingPoint> ladders = new ArrayList<>();
         List<LadderBoardingPoint> lowGunwales = new ArrayList<>();
         List<BlockPos> waterlineHullLocal = new ArrayList<>();
+        Set<BlockPos> hullSet = new LinkedHashSet<>();
         BlockPos deckCenterLocal = null;
 
         if (this.subLevelWorld == null || this.plotObj == null) {
@@ -96,21 +125,28 @@ public class SableShipData {
         }
 
         int[] box = SableBridge.getPlotBoundingBox(this.plotObj);
-        int minX = box != null ? box[0] : -8;
-        int minY = box != null ? box[1] : 0;
-        int minZ = box != null ? box[2] : -16;
-        int maxX = box != null ? box[3] : 8;
-        int maxY = box != null ? box[4] : 32;
-        int maxZ = box != null ? box[5] : 16;
+        if (box == null) {
+            // The old fallback box was made-up coordinates in plot space, where nothing can be found anyway.
+            return new ShipScanResult(ladders, lowGunwales, waterlineHullLocal, deckCenterLocal);
+        }
+        int minX = box[0];
+        int minY = box[1];
+        int minZ = box[2];
+        int maxX = box[3];
+        int maxY = box[4];
+        int maxZ = box[5];
 
-        // Estimate local Y coordinate corresponding to ocean sea level (world Y ~ 63.0)
-        Vec3 seaLevelWorld = new Vec3(this.worldBounds.getCenter().x, 63.0, this.worldBounds.getCenter().z);
+        // Local Y coordinate corresponding to the dimension's sea level (not a hard-coded 63)
+        double seaLevel = this.subLevelWorld.getSeaLevel();
+        AABB bounds = getWorldBounds();
+        Vec3 seaLevelWorld = new Vec3(bounds.getCenter().x, seaLevel, bounds.getCenter().z);
         Vec3 seaLevelLocal = transformPositionInverse(seaLevelWorld);
         int localWaterlineY = (int) Math.round(seaLevelLocal.y);
 
-        // Clamp scan range vertically around waterline and deck
+        // Clamp scan range vertically around waterline and deck. The upper bound used to be waterline+6, which
+        // truncated ladders on ships with more freeboard and gave the mob a bogus "top" inside the hull wall.
         int scanMinY = Math.max(minY, localWaterlineY - 4);
-        int scanMaxY = Math.min(maxY, localWaterlineY + 6);
+        int scanMaxY = Math.min(maxY, localWaterlineY + 16);
 
         // Map to track climbable column rungs: (x, z) packed key -> [minY, maxY, facingIndex]
         Map<Long, int[]> ladderColumns = new HashMap<>();
@@ -123,10 +159,8 @@ public class SableShipData {
                 for (int z = minZ; z <= maxZ; z++) {
                     mpos.set(x, y, z);
                     BlockState state = this.subLevelWorld.getBlockState(mpos);
-                    if (state.is(Blocks.LADDER) || state.is(Blocks.VINE) || state.is(BlockTags.CLIMBABLE)) {
-                        Direction facing = state.hasProperty(HorizontalDirectionalBlock.FACING)
-                                ? state.getValue(HorizontalDirectionalBlock.FACING)
-                                : Direction.NORTH;
+                    Direction facing = climbableFacing(state);
+                    if (facing != null) {
                         long colKey = (((long) x) << 32) | (z & 0xFFFFFFFFL);
                         int[] col = ladderColumns.get(colKey);
                         if (col == null) {
@@ -158,8 +192,8 @@ public class SableShipData {
             BlockState frontState = this.subLevelWorld.getBlockState(frontPos);
             if (frontState.isAir() || !frontState.getFluidState().isEmpty()) {
                 Vec3 bottomWorld = transformPosition(Vec3.atCenterOf(bottomPos));
-                // Ladder bottom must be near water level (<= 65.5) so mobs can reach it from water
-                if (bottomWorld.y <= 65.5 && bottomWorld.y >= 58.0) {
+                // Ladder bottom must be near water level so mobs can reach it from water
+                if (bottomWorld.y <= seaLevel + 2.5 && bottomWorld.y >= seaLevel - 5.0) {
                     ladders.add(new LadderBoardingPoint(bottomPos, topPos, facing, false));
                 }
             }
@@ -175,7 +209,7 @@ public class SableShipData {
                     mpos.set(x, y, z);
                     BlockState st = this.subLevelWorld.getBlockState(mpos);
                     if (isSolidHull(st)) {
-                        waterlineHullLocal.add(mpos.immutable());
+                        hullSet.add(mpos.immutable());
                         break;
                     }
                 }
@@ -184,7 +218,7 @@ public class SableShipData {
                     mpos.set(x, y, z);
                     BlockState st = this.subLevelWorld.getBlockState(mpos);
                     if (isSolidHull(st)) {
-                        waterlineHullLocal.add(mpos.immutable());
+                        hullSet.add(mpos.immutable());
                         break;
                     }
                 }
@@ -197,7 +231,7 @@ public class SableShipData {
                     mpos.set(x, y, z);
                     BlockState st = this.subLevelWorld.getBlockState(mpos);
                     if (isSolidHull(st)) {
-                        waterlineHullLocal.add(mpos.immutable());
+                        hullSet.add(mpos.immutable());
                         break;
                     }
                 }
@@ -206,22 +240,33 @@ public class SableShipData {
                     mpos.set(x, y, z);
                     BlockState st = this.subLevelWorld.getBlockState(mpos);
                     if (isSolidHull(st)) {
-                        waterlineHullLocal.add(mpos.immutable());
+                        hullSet.add(mpos.immutable());
                         break;
                     }
                 }
             }
         }
 
+        waterlineHullLocal.addAll(hullSet);
+
         // 3. Low Gunwales detection if no ladders are found
         if (ladders.isEmpty()) {
             for (BlockPos hp : waterlineHullLocal) {
                 Vec3 hpWorld = transformPosition(Vec3.atCenterOf(hp));
-                // If a hull edge block has world Y between 61.5 and 64.5, mobs can vault/climb over
-                if (hpWorld.y >= 61.5 && hpWorld.y <= 64.5) {
+                // If a hull edge block is within ~1.5 blocks of sea level, mobs can vault/climb over
+                if (hpWorld.y >= seaLevel - 1.5 && hpWorld.y <= seaLevel + 1.5) {
                     // Check if block above is open air
                     if (this.subLevelWorld.getBlockState(hp.above()).isAir()) {
-                        Direction outward = (hp.getX() <= (minX + maxX) / 2) ? Direction.WEST : Direction.EAST;
+                        // Outward = direction of the nearest edge of the plot box (bow/stern blocks used to be
+                        // treated as port/starboard because only the X axis was considered)
+                        int dWest = hp.getX() - minX;
+                        int dEast = maxX - hp.getX();
+                        int dNorth = hp.getZ() - minZ;
+                        int dSouth = maxZ - hp.getZ();
+                        int nearest = Math.min(Math.min(dWest, dEast), Math.min(dNorth, dSouth));
+                        Direction outward = nearest == dWest ? Direction.WEST
+                                : nearest == dEast ? Direction.EAST
+                                : nearest == dNorth ? Direction.NORTH : Direction.SOUTH;
                         lowGunwales.add(new LadderBoardingPoint(hp.below(), hp, outward, true));
                         if (lowGunwales.size() >= 4) break;
                     }
@@ -235,7 +280,32 @@ public class SableShipData {
     }
 
     private static boolean isSolidHull(BlockState state) {
-        return !state.isAir() && state.getFluidState().isEmpty() && !state.is(BlockTags.CLIMBABLE);
+        // Waterlogged slabs/stairs/fences are still hull; only pure fluid blocks must be excluded.
+        return !state.isAir()
+                && (state.getFluidState().isEmpty() || state.hasProperty(BlockStateProperties.WATERLOGGED))
+                && !state.is(BlockTags.CLIMBABLE);
+    }
+
+    /**
+     * The side a climbable block can be climbed from, or {@code null} if it is not a usable boarding ladder.
+     * Vines store their attachment in boolean properties rather than FACING, and other climbables (scaffolding,
+     * hanging vines) have no facing at all; those used to default to NORTH and create bogus boarding points.
+     */
+    private static Direction climbableFacing(BlockState state) {
+        if (state.is(Blocks.VINE)) {
+            for (Direction d : Direction.Plane.HORIZONTAL) {
+                if (state.getValue(VineBlock.getPropertyForFace(d))) {
+                    return d.getOpposite();
+                }
+            }
+            return null;
+        }
+        if (state.is(Blocks.LADDER) || state.is(BlockTags.CLIMBABLE)) {
+            return state.hasProperty(HorizontalDirectionalBlock.FACING)
+                    ? state.getValue(HorizontalDirectionalBlock.FACING)
+                    : null;
+        }
+        return null;
     }
 
     public static class ShipScanResult {

@@ -3,11 +3,13 @@ package com.serenemobmodifier.client;
 import com.mojang.blaze3d.platform.InputConstants;
 import com.serenemobmodifier.SereneMobModifier;
 import com.serenemobmodifier.client.gui.MobModifierScreen;
+import com.serenemobmodifier.network.ClientRuleCache;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
+import net.neoforged.neoforge.client.event.ClientPlayerNetworkEvent;
 import net.neoforged.neoforge.client.event.ClientTickEvent;
 import net.neoforged.neoforge.client.event.RegisterKeyMappingsEvent;
 import org.lwjgl.glfw.GLFW;
@@ -45,6 +47,12 @@ public final class KeyBindings {
 
     @EventBusSubscriber(modid = SereneMobModifier.MOD_ID, value = Dist.CLIENT)
     public static final class GameEvents {
+        /** Forget the previous server's rules so they are never shown while connected to a different one. */
+        @SubscribeEvent
+        public static void onLoggingOut(ClientPlayerNetworkEvent.LoggingOut event) {
+            ClientRuleCache.clear();
+        }
+
         @SubscribeEvent
         public static void onClientTick(ClientTickEvent.Post event) {
             Minecraft mc = Minecraft.getInstance();

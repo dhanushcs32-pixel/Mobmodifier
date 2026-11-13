@@ -91,7 +91,7 @@ public class MobModifierCommand {
             for (ServerLevel level : source.getServer().getAllLevels()) {
                 for (Entity entity : level.getAllEntities()) {
                     if (entity instanceof LivingEntity living && living.isAlive()) {
-                        if (MobModifierApplier.applyMatchingRules(living)) {
+                        if (MobModifierApplier.refreshEntity(living)) {
                             count++;
                         }
                     }
@@ -99,7 +99,7 @@ public class MobModifierCommand {
             }
         }
         int finalCount = count;
-        source.sendSuccess(() -> Component.literal("§a[SereneMobModifier] Reloaded rules and refreshed " + finalCount + " active entities."), true);
+        source.sendSuccess(() -> Component.literal("§a[SereneMobModifier] Re-applied the current rules to " + finalCount + " active entities. (Edits to the config file are picked up automatically.)"), true);
         return count;
     }
 

@@ -1,6 +1,7 @@
 package com.serenemobmodifier.client.gui;
 
 import com.serenemobmodifier.config.MobModifierConfig;
+import com.serenemobmodifier.network.ClientRuleCache;
 import com.serenemobmodifier.network.UpdateMobRulePayload;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
@@ -13,6 +14,9 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.util.Mth;
 import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.ai.attributes.AttributeSupplier;
+import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.MobCategory;
 import net.minecraft.world.entity.ai.attributes.DefaultAttributes;
 import net.neoforged.neoforge.network.PacketDistributor;
@@ -111,6 +115,8 @@ public class MobModifierScreen extends Screen {
     private final Map<String, MobRule> pendingEdits = new LinkedHashMap<>();
     // Loaded rules from config keyed by entity ID
     private final Map<String, MobRule> loadedRules = new LinkedHashMap<>();
+    /** Rules are read once per screen instance; init() also runs on every window resize. */
+    private boolean rulesLoaded = false;
     // Track which entity IDs have been modified in this session
     private final Set<String> dirtyIds = new HashSet<>();
 
@@ -139,6 +145,8 @@ public class MobModifierScreen extends Screen {
         public double follow = 32.0;
         public boolean hostile = false;
         public boolean boats = false;
+        /** Optional 9th rule field. {@code null} means "derive from scale" (the applier's default). */
+        public Double knockback = null;
 
         public MobRule(String entityId) {
             this.entityId = entityId;
@@ -153,6 +161,7 @@ public class MobModifierScreen extends Screen {
             r.follow = this.follow;
             r.hostile = this.hostile;
             r.boats = this.boats;
+            r.knockback = this.knockback;
             return r;
         }
 
@@ -171,6 +180,10 @@ public class MobModifierScreen extends Screen {
                 r.follow  = parseDoubleSafe(t[5]);
                 r.hostile = Boolean.parseBoolean(t[6].trim());
                 r.boats   = Boolean.parseBoolean(t[7].trim());
+                // Preserve the optional knockback field instead of silently dropping it on the next save
+                if (t.length >= 9) {
+                    r.knockback = parseDoubleSafe(t[8]);
+                }
                 return r;
             } catch (Exception e) {
                 com.serenemobmodifier.SereneMobModifier.LOGGER.error(
@@ -186,13 +199,15 @@ public class MobModifierScreen extends Screen {
 
         public String serialize() {
             return entityId + "|" + fmtD(scale) + "|" + fmtD(health) + "|" + fmtD(damage)
-                    + "|" + fmtD(speed) + "|" + fmtD(follow) + "|" + hostile + "|" + boats;
+                    + "|" + fmtD(speed) + "|" + fmtD(follow) + "|" + hostile + "|" + boats
+                    + (knockback != null ? "|" + fmtD(knockback) : "");
         }
 
+        /** Up to two decimals (hand-edited values like 1.25 used to be rounded to one decimal on every save). */
         private static String fmtD(double v) {
-            if (v == (long) v) return ((long) v) + ".0";
             // Force US English dot formatting regardless of the player's OS locale
-            return String.format(Locale.ROOT, "%.1f", v);
+            String s = String.format(Locale.ROOT, "%.2f", v);
+            return s.endsWith("0") ? s.substring(0, s.length() - 1) : s;
         }
     }
 
@@ -219,17 +234,43 @@ public class MobModifierScreen extends Screen {
             return false;
         }
 
-        if (type.getCategory() == MobCategory.MISC) {
-            // Must have supplier (already verified) and no blacklist keywords (already verified)
-            return true;
-        }
-
         return true;
+    }
+
+    /** Null-returning lookup; the default registry's get() answers unknown ids with minecraft:pig. */
+    private static EntityType<?> lookupType(String id) {
+        ResourceLocation rl = ResourceLocation.tryParse(id);
+        return rl == null ? null : BuiltInRegistries.ENTITY_TYPE.getOptional(rl).orElse(null);
+    }
+
+    private static double defaultFollowRange(String entityId) {
+        ResourceLocation rl = ResourceLocation.tryParse(entityId);
+        if (rl != null) {
+            EntityType<?> type = BuiltInRegistries.ENTITY_TYPE.getOptional(rl).orElse(null);
+            if (type != null && DefaultAttributes.hasSupplier(type)) {
+                try {
+                    @SuppressWarnings("unchecked")
+                    AttributeSupplier supplier = DefaultAttributes.getSupplier((EntityType<? extends LivingEntity>) type);
+                    if (supplier.hasAttribute(Attributes.FOLLOW_RANGE)) {
+                        return supplier.getBaseValue(Attributes.FOLLOW_RANGE);
+                    }
+                } catch (RuntimeException ignored) {
+                    // fall through to the default
+                }
+            }
+        }
+        return 32.0;
     }
 
     @Override
     protected void init() {
         super.init();
+
+        // init() is re-run on every window resize / GUI-scale change. Remember what the user was doing so a
+        // resize does not clear the search box or move the selection onto a different mob.
+        String keepSearch = searchBox != null ? searchBox.getValue() : "";
+        String keepSelected = (selectedIndex >= 0 && selectedIndex < filteredEntityIds.size())
+                ? filteredEntityIds.get(selectedIndex) : null;
 
         // Gather all living entity type IDs from the registry
         allEntityIds.clear();
@@ -242,22 +283,30 @@ public class MobModifierScreen extends Screen {
             }
         }
         allEntityIds.sort((id1, id2) -> {
-            EntityType<?> t1 = BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation.tryParse(id1));
-            EntityType<?> t2 = BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation.tryParse(id2));
+            EntityType<?> t1 = lookupType(id1);
+            EntityType<?> t2 = lookupType(id2);
             String n1 = t1 != null ? t1.getDescription().getString() : id1;
             String n2 = t2 != null ? t2.getDescription().getString() : id2;
             int cmp = n1.compareToIgnoreCase(n2);
             return cmp != 0 ? cmp : id1.compareTo(id2);
         });
 
-        // Load existing rules from config
-        loadedRules.clear();
-        List<?> configRules = MobModifierConfig.MODIFIER_RULES.get();
-        if (configRules != null) {
-            for (Object obj : configRules) {
-                MobRule r = MobRule.parse(String.valueOf(obj));
-                if (r != null) {
-                    loadedRules.put(r.entityId, r);
+        // Load existing rules once. Prefer the rules the server sent us: COMMON config is not synced, so on a
+        // dedicated server the local config is unrelated to what is actually in force. Re-reading on every
+        // resize also threw away rules that had just been applied (the local config never sees them).
+        if (!rulesLoaded) {
+            rulesLoaded = true;
+            loadedRules.clear();
+            List<?> configRules = ClientRuleCache.get();
+            if (configRules == null) {
+                configRules = MobModifierConfig.MODIFIER_RULES.get();
+            }
+            if (configRules != null) {
+                for (Object obj : configRules) {
+                    MobRule r = MobRule.parse(String.valueOf(obj));
+                    if (r != null) {
+                        loadedRules.put(r.entityId, r);
+                    }
                 }
             }
         }
@@ -270,6 +319,7 @@ public class MobModifierScreen extends Screen {
         searchBox.setMaxLength(128);
         searchBox.setHint(Component.literal("Search entities..."));
         searchBox.setBordered(true);
+        searchBox.setValue(keepSearch); // before the responder is attached so it does not reset the selection
         searchBox.setResponder(text -> {
             listScrollOffset = 0;
             rightPanelScrollOffset = 0;
@@ -280,6 +330,11 @@ public class MobModifierScreen extends Screen {
         this.addRenderableWidget(searchBox);
 
         rebuildFilteredList();
+
+        selectedIndex = keepSelected != null ? filteredEntityIds.indexOf(keepSelected) : -1;
+        if (selectedIndex < 0) {
+            currentEdit = null;
+        }
     }
 
     private void rebuildFilteredList() {
@@ -289,7 +344,7 @@ public class MobModifierScreen extends Screen {
         for (String id : allEntityIds) {
             if (!matchesTab(id)) continue;
             if (!query.isEmpty()) {
-                EntityType<?> type = BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation.tryParse(id));
+                EntityType<?> type = lookupType(id);
                 String displayName = type != null ? type.getDescription().getString().toLowerCase(Locale.ROOT) : "";
                 if (!id.toLowerCase(Locale.ROOT).contains(query) && !displayName.contains(query)) {
                     continue;
@@ -300,7 +355,7 @@ public class MobModifierScreen extends Screen {
     }
 
     private boolean matchesTab(String id) {
-        EntityType<?> type = BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation.tryParse(id));
+        EntityType<?> type = lookupType(id);
         if (type == null || !isLivingMob(type)) return false;
 
         return switch (activeTab) {
@@ -431,7 +486,7 @@ public class MobModifierScreen extends Screen {
         for (int i = 0; i < maxVisibleItems && (i + listScrollOffset) < totalItems; i++) {
             int idx = i + listScrollOffset;
             String entityId = filteredEntityIds.get(idx);
-            EntityType<?> type = BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation.tryParse(entityId));
+            EntityType<?> type = lookupType(entityId);
             String displayName = type != null ? type.getDescription().getString() : entityId;
             ResourceLocation rl = ResourceLocation.tryParse(entityId);
             String namespace = rl != null ? rl.getNamespace() : "";
@@ -527,6 +582,9 @@ public class MobModifierScreen extends Screen {
                 currentEdit.entityId = entityId; // Preserve current mob ID if cloned from a wildcard rule
             } else {
                 currentEdit = new MobRule(entityId);
+                // Start from the mob's real follow range. A hard-coded 32 would now change (lower or raise)
+                // the follow range of every mob the user merely wanted to rescale.
+                currentEdit.follow = defaultFollowRange(entityId);
             }
         }
 
@@ -541,7 +599,7 @@ public class MobModifierScreen extends Screen {
         gfx.enableScissor(panelX, panelY, panelX + panelW, panelY + panelH);
 
         // ── Entity Title ──
-        EntityType<?> selType = BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation.tryParse(entityId));
+        EntityType<?> selType = lookupType(entityId);
         String selName = selType != null ? selType.getDescription().getString() : entityId;
         gfx.drawString(this.font, "§l§f" + selName, cx, cy, COL_TEXT, false);
         cy += 11;
@@ -625,9 +683,9 @@ public class MobModifierScreen extends Screen {
         // Value label
         String valStr;
         if (step >= 1.0) {
-            valStr = String.format("%.0f", value);
+            valStr = String.format(Locale.ROOT, "%.0f", value);
         } else {
-            valStr = String.format("%.1f×", value);
+            valStr = MobRule.fmtD(value) + "×";
         }
         gfx.drawString(this.font, valStr, sliderX + sliderW + 6, y + 2, COL_ACCENT, false);
 
@@ -929,6 +987,17 @@ public class MobModifierScreen extends Screen {
      */
     private void applyChanges() {
         saveCurrentEditToPending();
+
+        // On a server without the mod there is no channel; PacketDistributor.sendToServer would throw
+        // UnsupportedOperationException from inside this click handler and crash the client.
+        if (this.minecraft == null || this.minecraft.getConnection() == null
+                || !this.minecraft.getConnection().hasChannel(UpdateMobRulePayload.TYPE)) {
+            if (this.minecraft != null && this.minecraft.player != null) {
+                this.minecraft.player.displayClientMessage(Component.literal(
+                        "§c[SereneMobModifier] This server does not have Serene Mob Modifier; changes were not sent."), false);
+            }
+            return;
+        }
 
         for (String entityId : dirtyIds) {
             MobRule rule = pendingEdits.get(entityId);

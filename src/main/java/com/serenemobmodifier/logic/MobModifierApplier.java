@@ -3,15 +3,21 @@ package com.serenemobmodifier.logic;
 import com.serenemobmodifier.SereneMobModifier;
 import com.serenemobmodifier.config.MobModifierConfig;
 import com.serenemobmodifier.logic.ai.AttackAndBoardShipGoal;
+import net.minecraft.core.Holder;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
+import net.minecraft.world.entity.PathfinderMob;
+import net.minecraft.world.entity.ai.attributes.Attribute;
 import net.minecraft.world.entity.ai.attributes.AttributeInstance;
 import net.minecraft.world.entity.ai.attributes.AttributeModifier;
 import net.minecraft.world.entity.ai.attributes.Attributes;
+import net.minecraft.world.entity.ai.goal.Goal;
+import net.minecraft.world.entity.ai.goal.MeleeAttackGoal;
 import net.minecraft.world.entity.ai.goal.WrappedGoal;
 import net.minecraft.world.entity.ai.goal.target.NearestAttackableTargetGoal;
+import net.minecraft.world.entity.monster.Enemy;
 import net.minecraft.world.entity.player.Player;
 
 import java.util.List;
@@ -28,10 +34,37 @@ public class MobModifierApplier {
 
     public static final String NBT_HEALTH_INITIALIZED = "SereneMobHealthInitialized";
 
+    /** Invalid rule strings already reported, so a bad rule is logged once instead of on every entity join. */
+    private static final java.util.Set<String> REPORTED_BAD_RULES = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    private static void reportBadRule(String rule, String reason) {
+        if (REPORTED_BAD_RULES.add(rule)) {
+            SereneMobModifier.LOGGER.error("[SereneMobModifier] Ignoring invalid rule '{}': {}", rule, reason);
+        }
+    }
+
     public static class SereneAttackPlayerGoal extends NearestAttackableTargetGoal<Player> {
         public SereneAttackPlayerGoal(Mob mob) {
             super(mob, Player.class, true);
         }
+    }
+
+    /**
+     * Basic melee behaviour for mobs that were made hostile but have no attack AI of their own (cows, sheep,
+     * fish, ...). Without it they would acquire a player as target and then just stand there.
+     */
+    public static class SereneMeleeGoal extends MeleeAttackGoal {
+        public SereneMeleeGoal(PathfinderMob mob) {
+            super(mob, 1.2D, true);
+        }
+    }
+
+    private static boolean hasOwnAttackGoal(Mob mob) {
+        return mob.goalSelector.getAvailableGoals().stream()
+                .map(WrappedGoal::getGoal)
+                .anyMatch(g -> !(g instanceof SereneMeleeGoal)
+                        && !(g instanceof AttackAndBoardShipGoal)
+                        && (g instanceof MeleeAttackGoal || g.getClass().getSimpleName().contains("Attack")));
     }
 
     public static boolean applyMatchingRules(LivingEntity entity) {
@@ -44,22 +77,31 @@ public class MobModifierApplier {
             return false;
         }
 
-        for (Object ruleObj : rules) {
-            String ruleStr = String.valueOf(ruleObj);
-            String[] tokens = ruleStr.split("\\|");
-            if (tokens.length < 8) continue;
+        // Two passes so that an exact entity-id rule always beats a namespace wildcard,
+        // regardless of where each sits in the config list (the GUI appends new rules at the end).
+        for (int pass = 0; pass < 2; pass++) {
+            boolean wildcardPass = pass == 1;
+            for (Object ruleObj : rules) {
+                String ruleStr = String.valueOf(ruleObj);
+                String[] tokens = ruleStr.split("\\|");
+                if (tokens.length < 8) {
+                    if (pass == 0) reportBadRule(ruleStr, "expected at least 8 '|'-separated fields");
+                    continue;
+                }
 
-            String pattern = tokens[0].trim();
-            boolean match;
+                String pattern = tokens[0].trim();
+                boolean isWildcard = pattern.endsWith(":*");
+                if (isWildcard != wildcardPass) continue;
 
-            if (pattern.endsWith(":*")) {
-                String targetNamespace = pattern.substring(0, pattern.indexOf(":*"));
-                match = namespace.equalsIgnoreCase(targetNamespace);
-            } else {
-                match = fullId.equalsIgnoreCase(pattern);
-            }
+                boolean match;
+                if (isWildcard) {
+                    String targetNamespace = pattern.substring(0, pattern.length() - 2);
+                    match = namespace.equalsIgnoreCase(targetNamespace);
+                } else {
+                    match = fullId.equalsIgnoreCase(pattern);
+                }
+                if (!match) continue;
 
-            if (match) {
                 try {
                     double scaleMult = Double.parseDouble(tokens[1].trim());
                     double healthMult = Double.parseDouble(tokens[2].trim());
@@ -79,11 +121,54 @@ public class MobModifierApplier {
                     applyModifiers(entity, scaleMult, healthMult, damageMult, speedMult, followRange, knockbackVal, hostileToPlayers, targetBoats);
                     return true;
                 } catch (Exception e) {
-                    SereneMobModifier.LOGGER.error("[SereneMobModifier] Error parsing rule: {}", ruleStr, e);
+                    reportBadRule(ruleStr, e.toString());
                 }
             }
         }
         return false;
+    }
+
+    /**
+     * Brings an entity in line with the current config: applies the matching rule if modifications are
+     * enabled and a rule matches, otherwise strips everything this mod previously added.
+     *
+     * <p>Attribute modifiers are permanent and saved with the entity, so without the cleanup path deleting
+     * a rule (or disabling {@code globalEnable}) would leave already-modified mobs changed forever.</p>
+     *
+     * @return {@code true} if a rule was applied
+     */
+    public static boolean refreshEntity(LivingEntity entity) {
+        if (MobModifierConfig.GLOBAL_ENABLE.get() && applyMatchingRules(entity)) {
+            return true;
+        }
+        clearModifiers(entity);
+        return false;
+    }
+
+    /**
+     * Removes every attribute modifier, persisted flag and AI goal this mod added to the entity.
+     */
+    public static void clearModifiers(LivingEntity entity) {
+        removeModifier(entity, Attributes.SCALE, SCALE_MOD_ID);
+        removeModifier(entity, Attributes.MAX_HEALTH, HEALTH_MOD_ID);
+        removeModifier(entity, Attributes.ATTACK_DAMAGE, DAMAGE_MOD_ID);
+        removeModifier(entity, Attributes.MOVEMENT_SPEED, SPEED_MOD_ID);
+        removeModifier(entity, Attributes.FOLLOW_RANGE, FOLLOW_MOD_ID);
+        removeModifier(entity, Attributes.KNOCKBACK_RESISTANCE, KNOCKBACK_MOD_ID);
+
+        if (entity.getPersistentData().contains(NBT_HEALTH_INITIALIZED)) {
+            entity.getPersistentData().remove(NBT_HEALTH_INITIALIZED);
+        }
+        if (entity instanceof Mob mob) {
+            applyGoals(mob, false, false, 0.0);
+        }
+    }
+
+    private static void removeModifier(LivingEntity entity, Holder<Attribute> attribute, ResourceLocation id) {
+        AttributeInstance instance = entity.getAttribute(attribute);
+        if (instance != null && instance.hasModifier(id)) {
+            instance.removeModifier(id);
+        }
     }
 
     private static void applyModifiers(LivingEntity entity, double scaleMult, double healthMult,
@@ -111,7 +196,10 @@ public class MobModifierApplier {
         // 2. Max Health & Proportional Healing Attribute Modifier
         AttributeInstance healthAttr = entity.getAttribute(Attributes.MAX_HEALTH);
         if (healthAttr != null && healthMult > 0.0) {
-            boolean isFirstInit = !healthAttr.hasModifier(HEALTH_MOD_ID) || !entity.getPersistentData().getBoolean(NBT_HEALTH_INITIALIZED);
+            // Only the persisted flag decides this. Checking hasModifier() as well made every mob with a
+            // 1.0x health multiplier (no modifier is ever added) count as "first init" and heal to full on
+            // each chunk load, /mobmodifier reload and GUI apply.
+            boolean isFirstInit = !entity.getPersistentData().getBoolean(NBT_HEALTH_INITIALIZED);
             if (Math.abs(healthMult - 1.0) > 0.0001) {
                 healthAttr.addOrReplacePermanentModifier(new AttributeModifier(HEALTH_MOD_ID, healthMult - 1.0, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL));
             } else {
@@ -148,8 +236,9 @@ public class MobModifierApplier {
         // 5. Follow Range Attribute Modifier
         AttributeInstance followAttr = entity.getAttribute(Attributes.FOLLOW_RANGE);
         if (followAttr != null && followRange > 0.0) {
+            // Allow lowering as well as raising the follow range (a negative ADD_VALUE modifier).
             double diff = followRange - followAttr.getBaseValue();
-            if (diff > 0.0001) {
+            if (Math.abs(diff) > 0.0001) {
                 followAttr.addOrReplacePermanentModifier(new AttributeModifier(FOLLOW_MOD_ID, diff, AttributeModifier.Operation.ADD_VALUE));
             } else {
                 followAttr.removeModifier(FOLLOW_MOD_ID);
@@ -208,19 +297,42 @@ public class MobModifierApplier {
                     .forEach(mob.targetSelector::removeGoal);
         }
 
-        // Boat & ship targeting goal
-        boolean hasBoatGoal = mob.goalSelector.getAvailableGoals().stream()
-                .anyMatch(g -> g.getGoal() instanceof AttackAndBoardShipGoal);
-        if (targetBoats) {
-            if (!hasBoatGoal) {
-                mob.goalSelector.addGoal(1, new AttackAndBoardShipGoal(mob, Math.max(followRange, 32.0)));
+        // Melee fallback for hostile-flagged mobs that cannot attack on their own. Vanilla hostile mobs
+        // (Enemy) and anything that already has an attack goal are left alone.
+        boolean hasMeleeGoal = mob.goalSelector.getAvailableGoals().stream()
+                .anyMatch(g -> g.getGoal() instanceof SereneMeleeGoal);
+        boolean needsMelee = hostileToPlayers && mob instanceof PathfinderMob && !(mob instanceof Enemy)
+                && !hasOwnAttackGoal(mob);
+        if (needsMelee) {
+            if (!hasMeleeGoal) {
+                mob.goalSelector.addGoal(2, new SereneMeleeGoal((PathfinderMob) mob));
             }
-        } else if (hasBoatGoal) {
+        } else if (hasMeleeGoal) {
             mob.goalSelector.getAvailableGoals().stream()
-                    .filter(g -> g.getGoal() instanceof AttackAndBoardShipGoal)
+                    .filter(g -> g.getGoal() instanceof SereneMeleeGoal)
                     .map(WrappedGoal::getGoal)
                     .toList()
                     .forEach(mob.goalSelector::removeGoal);
+        }
+
+        // Boat & ship targeting goal. The goal captures its search radius and player-hostility at construction,
+        // so an existing instance built from an older rule must be replaced rather than kept.
+        double desiredRadius = Math.max(followRange, 32.0);
+        boolean boatGoalUpToDate = false;
+        List<Goal> existingBoatGoals = mob.goalSelector.getAvailableGoals().stream()
+                .map(WrappedGoal::getGoal)
+                .filter(g -> g instanceof AttackAndBoardShipGoal)
+                .toList();
+        for (Goal existing : existingBoatGoals) {
+            if (targetBoats && !boatGoalUpToDate
+                    && ((AttackAndBoardShipGoal) existing).hasSettings(desiredRadius, hostileToPlayers)) {
+                boatGoalUpToDate = true;
+            } else {
+                mob.goalSelector.removeGoal(existing);
+            }
+        }
+        if (targetBoats && !boatGoalUpToDate) {
+            mob.goalSelector.addGoal(1, new AttackAndBoardShipGoal(mob, desiredRadius, hostileToPlayers));
         }
     }
 
@@ -232,15 +344,5 @@ public class MobModifierApplier {
     private static String formatVal(double v) {
         if (v == (long) v) return String.valueOf((long) v);
         return String.format(Locale.ROOT, "%.2f", v);
-    }
-
-    /**
-     * AI Goal directing aquatic predators to hunt, ram, and attack vanilla boats
-     * and intercept, board, or ram assembled Sable sub-level ships.
-     */
-    public static class TargetBoatGoal extends AttackAndBoardShipGoal {
-        public TargetBoatGoal(Mob mob, double searchRadius) {
-            super(mob, searchRadius);
-        }
     }
 }

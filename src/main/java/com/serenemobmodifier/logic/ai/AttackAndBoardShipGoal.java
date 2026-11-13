@@ -9,6 +9,7 @@ import net.minecraft.sounds.SoundEvents;
 import net.minecraft.util.Mth;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EntitySelector;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.ai.attributes.Attributes;
@@ -51,6 +52,8 @@ public class AttackAndBoardShipGoal extends Goal {
 
     protected final Mob mob;
     protected final double searchRadius;
+    /** Whether this mob is configured as hostile to players (the rule's "Hostile to Players" toggle). */
+    protected final boolean attackPlayers;
 
     protected Boat targetBoat;
     protected SableShipData targetShip;
@@ -62,22 +65,29 @@ public class AttackAndBoardShipGoal extends Goal {
     protected int climbTicks = 0;
     protected int onDeckTicks = 0;
 
-    public AttackAndBoardShipGoal(Mob mob, double searchRadius) {
+    /** Polls remaining before the next (expensive) target scan in {@link #canUse()}. */
+    private int scanDelay = 0;
+
+    public AttackAndBoardShipGoal(Mob mob, double searchRadius, boolean attackPlayers) {
         this.mob = mob;
         this.searchRadius = searchRadius;
+        this.attackPlayers = attackPlayers;
         this.setFlags(EnumSet.of(Goal.Flag.MOVE, Goal.Flag.LOOK));
     }
 
     @Override
     public boolean canUse() {
-        // If mob has an attack target, check if that target is in a boat or on a ship
-        LivingEntity currentTarget = this.mob.getTarget();
-        if (currentTarget != null) {
-            boolean targetInBoat = currentTarget.getVehicle() instanceof Boat;
-            boolean targetNearMob = this.mob.distanceToSqr(currentTarget) < 36.0;
-            if (!targetInBoat && targetNearMob) {
-                return false;
-            }
+        // canUse() is polled every other tick for every idle mob, and the scans below (entity query over a
+        // 2*radius cube, sub-level lookup) are expensive. Stagger them to roughly every 10 ticks per mob.
+        if (this.scanDelay > 0) {
+            this.scanDelay--;
+            return false;
+        }
+        this.scanDelay = 4 + this.mob.getRandom().nextInt(3);
+
+        // A nearby target that is not riding a boat belongs to the mob's normal combat AI
+        if (shouldYieldToNearbyTarget()) {
+            return false;
         }
 
         Vec3 mobPos = this.mob.position();
@@ -112,10 +122,13 @@ public class AttackAndBoardShipGoal extends Goal {
 
         // 2. Scan for vanilla Boat entities
         Boat chosenBoat = null;
+        // Use the same sphere as canContinueToUse(); boats in the corners of the inflated cube used to be
+        // selected and then dropped immediately, making the goal start/stop every poll.
+        final double radiusSq = this.searchRadius * this.searchRadius;
         List<Boat> nearbyBoats = this.mob.level().getEntitiesOfClass(
                 Boat.class,
                 this.mob.getBoundingBox().inflate(this.searchRadius),
-                b -> b.isAlive() && !b.isRemoved()
+                b -> b.isAlive() && !b.isRemoved() && this.mob.distanceToSqr(b) < radiusSq
         );
         if (!nearbyBoats.isEmpty()) {
             double closestBoatDistSq = Double.MAX_VALUE;
@@ -149,6 +162,19 @@ public class AttackAndBoardShipGoal extends Goal {
         }
 
         return false;
+    }
+
+    /**
+     * True when the mob's current attack target is standing close by and is not in a boat. The mob's own
+     * melee goal (lower priority than this one) should handle it instead of this goal pulling the mob away
+     * to attack an empty boat or ship.
+     */
+    private boolean shouldYieldToNearbyTarget() {
+        LivingEntity currentTarget = this.mob.getTarget();
+        if (currentTarget == null) return false;
+        boolean targetInBoat = currentTarget.getVehicle() instanceof Boat;
+        boolean targetNearMob = this.mob.distanceToSqr(currentTarget) < 36.0;
+        return !targetInBoat && targetNearMob;
     }
 
     private void setupBoatTarget(Boat boat) {
@@ -231,6 +257,12 @@ public class AttackAndBoardShipGoal extends Goal {
 
     @Override
     public boolean canContinueToUse() {
+        // Previously only canUse() checked for a nearby target, so once started the mob kept hammering an empty
+        // boat while a player stood next to it. (On deck the goal sets the target itself, so don't yield there.)
+        if (this.stage != Stage.CLIMBING_LADDER && this.stage != Stage.ON_DECK && shouldYieldToNearbyTarget()) {
+            return false;
+        }
+
         if (this.targetBoat != null) {
             return this.targetBoat.isAlive()
                     && !this.targetBoat.isRemoved()
@@ -244,6 +276,22 @@ public class AttackAndBoardShipGoal extends Goal {
         }
 
         return false;
+    }
+
+    /** True if this goal instance was built with the given settings (used to detect outdated goals). */
+    public boolean hasSettings(double searchRadius, boolean attackPlayers) {
+        return this.searchRadius == searchRadius && this.attackPlayers == attackPlayers;
+    }
+
+    /**
+     * Without this, Mob#serverAiStep only ticks running goals on every second game tick (the parity depends
+     * on the mob's id and spawn tick). The goal relies on {@code tickCount % 10/20/30} checks for navigation
+     * and target refresh, which never fire for mobs whose polls land on odd tickCounts, and its "20 tick"
+     * attack cooldown effectively lasted 40 ticks.
+     */
+    @Override
+    public boolean requiresUpdateEveryTick() {
+        return true;
     }
 
     @Override
@@ -310,11 +358,16 @@ public class AttackAndBoardShipGoal extends Goal {
 
         this.targetBoat.hurt(this.mob.damageSources().mobAttack(this.mob), damage);
 
+        // Only hit passengers this mob is actually hostile to: players (when the rule makes it hostile to
+        // players) or its current attack target. Villagers, pets and other mobs riding the boat are left alone.
         for (Entity passenger : this.targetBoat.getPassengers()) {
-            if (passenger instanceof LivingEntity livingPassenger) {
-                livingPassenger.hurt(this.mob.damageSources().mobAttack(this.mob), damage);
-                livingPassenger.knockback(0.4, this.mob.getX() - livingPassenger.getX(), this.mob.getZ() - livingPassenger.getZ());
-            }
+            if (!(passenger instanceof LivingEntity livingPassenger)) continue;
+            boolean isHostileTarget = livingPassenger == this.mob.getTarget()
+                    || (this.attackPlayers && livingPassenger instanceof Player);
+            if (!isHostileTarget) continue;
+
+            livingPassenger.hurt(this.mob.damageSources().mobAttack(this.mob), damage);
+            livingPassenger.knockback(0.4, this.mob.getX() - livingPassenger.getX(), this.mob.getZ() - livingPassenger.getZ());
         }
     }
 
@@ -460,12 +513,27 @@ public class AttackAndBoardShipGoal extends Goal {
             return;
         }
 
-        // Hunt nearby players on or near the vessel
-        Player nearestPlayer = this.mob.level().getNearestPlayer(this.mob, 32.0);
+        // Hunt nearby players on or near the vessel (only if the rule makes this mob hostile to players, and
+        // never creative/spectator players, which could not be hurt and would trap the mob in a pointless chase)
+        Player nearestPlayer = null;
+        if (this.attackPlayers) {
+            nearestPlayer = this.mob.level().getNearestPlayer(
+                    this.mob.getX(), this.mob.getY(), this.mob.getZ(), 32.0, EntitySelector.NO_CREATIVE_OR_SPECTATOR);
+        }
         if (nearestPlayer != null) {
             this.mob.setTarget(nearestPlayer);
             if (this.mob.tickCount % 10 == 0) {
                 this.mob.getNavigation().moveTo(nearestPlayer, 1.25);
+            }
+
+            // This goal holds MOVE|LOOK at priority 1, so the mob's own (lower priority) melee goal cannot run
+            // while we are active. Deliver the melee attack here, otherwise boarded mobs never hurt anyone.
+            double reach = this.mob.getBbWidth() * 2.0F;
+            double reachSqr = reach * reach + nearestPlayer.getBbWidth();
+            if (this.attackCooldown <= 0 && this.mob.distanceToSqr(nearestPlayer) <= reachSqr) {
+                this.attackCooldown = 20;
+                this.mob.swing(InteractionHand.MAIN_HAND);
+                this.mob.doHurtTarget(nearestPlayer);
             }
         } else {
             // Pathfind across deck toward the ship's deck center or helm
@@ -530,18 +598,27 @@ public class AttackAndBoardShipGoal extends Goal {
         if (damage <= 0.0f) damage = 4.0f;
 
         // Apply physical knock and rocking impulse to the assembled ship contraption
-        Vec3 dir = hitPos.subtract(this.mob.position()).normalize();
-        double impulseMag = Math.max(damage * 350.0, 1200.0);
-        Vec3 impulse = new Vec3(dir.x * impulseMag, 300.0, dir.z * impulseMag);
-        SableBridge.applyImpulseAtPoint(this.targetShip.subLevel(), hitPos, impulse);
+        // Sable expects a plot-local position and a local-frame impulse, not world-space values.
+        if (this.targetHullLocal != null) {
+            Vec3 dir = hitPos.subtract(this.mob.position()).normalize();
+            double impulseMag = Math.max(damage * 350.0, 1200.0);
+            Vec3 worldImpulse = new Vec3(dir.x * impulseMag, 300.0, dir.z * impulseMag);
+            Vec3 localImpulse = this.targetShip.transformNormalInverse(worldImpulse);
+            if (localImpulse != null) {
+                SableBridge.applyImpulseAtPoint(this.targetShip.subLevel(), Vec3.atCenterOf(this.targetHullLocal), localImpulse);
+            }
+        }
 
         // Damage any players within close reach of the hull impact
         AABB impactZone = new AABB(hitPos.x - 2.5, hitPos.y - 2.0, hitPos.z - 2.5,
                 hitPos.x + 2.5, hitPos.y + 2.5, hitPos.z + 2.5);
-        List<Player> nearbyPlayers = this.mob.level().getEntitiesOfClass(Player.class, impactZone);
-        for (Player p : nearbyPlayers) {
-            p.hurt(this.mob.damageSources().mobAttack(this.mob), damage);
-            p.knockback(0.35, this.mob.getX() - p.getX(), this.mob.getZ() - p.getZ());
+        if (this.attackPlayers) {
+            List<Player> nearbyPlayers = this.mob.level().getEntitiesOfClass(
+                    Player.class, impactZone, EntitySelector.NO_CREATIVE_OR_SPECTATOR);
+            for (Player p : nearbyPlayers) {
+                p.hurt(this.mob.damageSources().mobAttack(this.mob), damage);
+                p.knockback(0.35, this.mob.getX() - p.getX(), this.mob.getZ() - p.getZ());
+            }
         }
     }
 
@@ -562,10 +639,6 @@ public class AttackAndBoardShipGoal extends Goal {
     private void applyAquaticSwimVelocity(double dx, double dy, double dz, double distTotalSq, double clampMaxY) {
         if (!this.mob.isInWater()) {
             return;
-        }
-
-        if (this.mob.isNoGravity()) {
-            this.mob.setNoGravity(false);
         }
 
         if (this.mob.canBreatheUnderwater() || this.mob.isSwimming()) {
@@ -618,8 +691,5 @@ public class AttackAndBoardShipGoal extends Goal {
         this.targetHullLocal = null;
         this.stage = Stage.IDLE;
         this.mob.getNavigation().stop();
-        if (this.mob.isNoGravity()) {
-            this.mob.setNoGravity(false);
-        }
     }
 }
