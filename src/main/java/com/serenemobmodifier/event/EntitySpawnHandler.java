@@ -1,17 +1,28 @@
 package com.serenemobmodifier.event;
 
 import com.serenemobmodifier.logic.MobModifierApplier;
+import com.serenemobmodifier.logic.cerbon.CerbonsApiBridge;
+import com.serenemobmodifier.logic.spine.SereneBodyPartEntity;
+import com.serenemobmodifier.logic.spine.SpineSegmentManager;
 import com.serenemobmodifier.network.NetworkRegistration;
+import com.serenemobmodifier.util.HitboxParticleOutliner;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.damagesource.DamageSource;
 import net.minecraft.world.entity.EntityDimensions;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.ai.attributes.Attributes;
+import net.minecraft.world.entity.projectile.AbstractArrow;
+import net.minecraft.world.entity.projectile.Projectile;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.Vec3;
 import net.neoforged.bus.api.SubscribeEvent;
+import net.neoforged.neoforge.entity.PartEntity;
 import net.neoforged.neoforge.event.entity.EntityAttributeModificationEvent;
 import net.neoforged.neoforge.event.entity.EntityEvent;
 import net.neoforged.neoforge.event.entity.EntityJoinLevelEvent;
 import net.neoforged.neoforge.event.entity.player.PlayerEvent;
+import net.neoforged.neoforge.event.tick.EntityTickEvent;
 
 public class EntitySpawnHandler {
 
@@ -42,11 +53,77 @@ public class EntitySpawnHandler {
         if (event.getEntity() instanceof LivingEntity living) {
             float scale = living.getScale();
             if (Math.abs(scale - 1.0F) > 0.0001F) {
-                EntityDimensions currentNew = event.getNewSize();
                 EntityDimensions defaultDims = living.getType().getDimensions();
-                // If the dimension was not pre-scaled by getDimensions (e.g. custom mob overriding default dimensions), scale it
-                if (Math.abs(currentNew.width() - defaultDims.width()) < 0.001F && Math.abs(currentNew.height() - defaultDims.height()) < 0.001F) {
-                    event.setNewSize(currentNew.scale(scale));
+                float expectedWidth = defaultDims.width() * scale;
+                // If the newSize width is not scaled to expectedWidth (e.g. custom mob overriding default dimensions), scale it forcefully
+                if (Math.abs(event.getNewSize().width() - expectedWidth) > 0.01F) {
+                    EntityDimensions currentNew = event.getNewSize();
+                    event.setNewSize(EntityDimensions.scalable(currentNew.width() * scale, currentNew.height() * scale)
+                            .withEyeHeight(currentNew.eyeHeight() * scale));
+                }
+            }
+        } else if (event.getEntity() instanceof PartEntity<?> part) {
+            if (part.getParent() instanceof LivingEntity livingParent) {
+                float parentScale = livingParent.getScale();
+                if (Math.abs(parentScale - 1.0F) > 0.0001F) {
+                    EntityDimensions defaultDims = part.getType().getDimensions();
+                    float expectedWidth = defaultDims.width() * parentScale;
+                    if (Math.abs(event.getNewSize().width() - expectedWidth) > 0.01F) {
+                        EntityDimensions currentNew = event.getNewSize();
+                        event.setNewSize(EntityDimensions.scalable(currentNew.width() * parentScale, currentNew.height() * parentScale)
+                                .withEyeHeight(currentNew.eyeHeight() * parentScale));
+                    }
+                }
+            }
+        }
+    }
+
+    @SubscribeEvent
+    public static void onEntityTickPost(EntityTickEvent.Post event) {
+        if (event.getEntity() instanceof LivingEntity living) {
+            SpineSegmentManager.tick(living);
+            MobModifierApplier.enforceHitbox(living);
+            HitboxParticleOutliner.tickEntity(living);
+        } else if (event.getEntity() instanceof Projectile projectile && !projectile.level().isClientSide()) {
+            handleProjectileTrajectory(projectile);
+        }
+    }
+
+    private static void handleProjectileTrajectory(Projectile projectile) {
+        if (!projectile.isAlive()) return;
+        Vec3 pos = projectile.position();
+        Vec3 mov = projectile.getDeltaMovement();
+        if (mov.lengthSqr() < 0.005) return;
+        Vec3 nextPos = pos.add(mov);
+
+        AABB searchBox = projectile.getBoundingBox().expandTowards(mov).inflate(2.0);
+        for (LivingEntity nearby : projectile.level().getEntitiesOfClass(LivingEntity.class, searchBox, e -> e.isAlive() && e != projectile.getOwner())) {
+            // Check CerbonsAPI scaled segments
+            if (CerbonsApiBridge.isCerbonsMultipart(nearby)) {
+                if (CerbonsApiBridge.checkRaycastHit(nearby, pos, nextPos)) {
+                    DamageSource source = projectile.damageSources().arrow(
+                            (projectile instanceof AbstractArrow arrow) ? arrow : null,
+                            projectile.getOwner()
+                    );
+                    nearby.hurt(source, (float) (projectile instanceof AbstractArrow arrow ? arrow.getBaseDamage() * 2.0 : 4.0));
+                    projectile.discard();
+                    return;
+                }
+            }
+
+            // Check Serene Spine segments
+            SereneBodyPartEntity[] spineParts = SpineSegmentManager.getSpineSegments(nearby);
+            if (spineParts != null) {
+                for (SereneBodyPartEntity part : spineParts) {
+                    if (part.getBoundingBox().inflate(0.3).clip(pos, nextPos).isPresent()) {
+                        DamageSource source = projectile.damageSources().arrow(
+                                (projectile instanceof AbstractArrow arrow) ? arrow : null,
+                                projectile.getOwner()
+                        );
+                        part.hurt(source, (float) (projectile instanceof AbstractArrow arrow ? arrow.getBaseDamage() * 2.0 : 4.0));
+                        projectile.discard();
+                        return;
+                    }
                 }
             }
         }
@@ -61,7 +138,12 @@ public class EntitySpawnHandler {
 
     @SubscribeEvent
     public static void onEntityJoinLevel(EntityJoinLevelEvent event) {
-        if (event.getLevel().isClientSide()) return;
+        if (event.getLevel().isClientSide()) {
+            if (event.getEntity() instanceof LivingEntity living) {
+                MobModifierApplier.enforceHitbox(living);
+            }
+            return;
+        }
 
         if (!(event.getEntity() instanceof LivingEntity living)) return;
 

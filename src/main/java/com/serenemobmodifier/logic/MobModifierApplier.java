@@ -5,10 +5,16 @@ import com.serenemobmodifier.config.MobModifierConfig;
 import com.serenemobmodifier.logic.ai.AttackAndBoardShipGoal;
 import net.minecraft.core.Holder;
 import net.minecraft.core.registries.BuiltInRegistries;
+import com.serenemobmodifier.logic.cerbon.CerbonsApiBridge;
+import com.serenemobmodifier.logic.spine.SereneBodyPartEntity;
+import com.serenemobmodifier.logic.spine.SpineSegmentManager;
 import net.minecraft.network.protocol.game.ClientboundUpdateAttributesPacket;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.util.Mth;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EntityDimensions;
+import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.PathfinderMob;
@@ -22,10 +28,17 @@ import net.minecraft.world.entity.ai.goal.WrappedGoal;
 import net.minecraft.world.entity.ai.goal.target.NearestAttackableTargetGoal;
 import net.minecraft.world.entity.monster.Enemy;
 import net.minecraft.world.entity.player.Player;
+import net.neoforged.neoforge.entity.PartEntity;
 
+import java.lang.reflect.Field;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.WeakHashMap;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class MobModifierApplier {
 
@@ -56,7 +69,7 @@ public class MobModifierApplier {
     /**
      * Basic melee behaviour for mobs that were made hostile but have no attack AI of their own (cows, sheep,
      * fish, ...). Without it they would acquire a player as target and then just stand there.
-     * Overrides getAttackReachSqr to properly scale attack reach with the mob's bounding box width.
+     * Uses canPerformAttack to ensure attack reach accounts for the mob's scaled bounding box width.
      */
     public static class SereneMeleeGoal extends MeleeAttackGoal {
         public SereneMeleeGoal(PathfinderMob mob) {
@@ -171,7 +184,7 @@ public class MobModifierApplier {
         removeModifier(entity, Attributes.KNOCKBACK_RESISTANCE, KNOCKBACK_MOD_ID);
 
         // Force immediate bounding box refresh and sync cleared scale to clients
-        entity.refreshDimensions();
+        enforceHitbox(entity);
         syncScaleToTrackingClients(entity);
 
         if (entity.getPersistentData().contains(NBT_HEALTH_INITIALIZED)) {
@@ -283,8 +296,8 @@ public class MobModifierApplier {
             applyGoals(mob, hostileToPlayers, targetBoats, followRange);
         }
 
-        // Force immediate bounding box recalculation (dimensions, eye height, and physical AABB)
-        entity.refreshDimensions();
+        // Force immediate bounding box recalculation and enforce physical hitbox dimensions
+        enforceHitbox(entity);
 
         // Sync updated scale attribute immediately to all tracking clients
         syncScaleToTrackingClients(entity);
@@ -307,6 +320,275 @@ public class MobModifierApplier {
                     formatVal(beforeFollow), formatVal(afterFollow),
                     formatVal(beforeKb), formatVal(afterKb),
                     entity.getUUID());
+        }
+    }
+
+    private static class PartTrackingData {
+        final EntityDimensions baseDimensions;
+        double lastUnscaledDx;
+        double lastUnscaledDy;
+        double lastUnscaledDz;
+        double lastScaledX;
+        double lastScaledY;
+        double lastScaledZ;
+        boolean hasScaledPos = false;
+
+        PartTrackingData(EntityDimensions baseDimensions) {
+            this.baseDimensions = baseDimensions;
+        }
+    }
+
+    private static final Map<Entity, PartTrackingData> PART_TRACKING = new WeakHashMap<>();
+    private static final Map<Class<?>, List<Field>> SUB_PART_FIELDS_CACHE = new ConcurrentHashMap<>();
+
+    /**
+     * Resolves all child sub-hitbox entities for a given living entity.
+     * Checks both NeoForge's isMultipartEntity/getParts as well as scanning the class hierarchy
+     * for Entity fields, arrays (Entity[]), or collections (List<Entity>) used by multi-loader mods
+     * such as Myths of the Sea (CerbonsAPI / GeckoLib).
+     */
+    public static List<Entity> getAllSubParts(LivingEntity parent) {
+        List<Entity> subParts = new ArrayList<>();
+        if (parent == null) return subParts;
+
+        // 1. NeoForge isMultipartEntity / getParts
+        if (parent.isMultipartEntity()) {
+            PartEntity<?>[] parts = parent.getParts();
+            if (parts != null) {
+                for (PartEntity<?> part : parts) {
+                    if (part != null && part != (Object) parent && !subParts.contains(part)) {
+                        subParts.add(part);
+                    }
+                }
+            }
+        }
+
+        // 2. Dynamic spine segments for serpent/leviathan mobs
+        SereneBodyPartEntity[] spineParts = SpineSegmentManager.getSpineSegments(parent);
+        if (spineParts != null) {
+            for (SereneBodyPartEntity p : spineParts) {
+                if (p != null && !subParts.contains(p)) {
+                    subParts.add(p);
+                }
+            }
+        }
+
+        // 3. Reflected fields for multi-loader body segments
+        List<Field> fields = SUB_PART_FIELDS_CACHE.computeIfAbsent(parent.getClass(), clazz -> {
+            List<Field> discovered = new ArrayList<>();
+            Class<?> curr = clazz;
+            while (curr != null && curr != LivingEntity.class && curr != Mob.class && curr != PathfinderMob.class && curr != Object.class) {
+                for (Field field : curr.getDeclaredFields()) {
+                    Class<?> type = field.getType();
+                    if (Entity.class.isAssignableFrom(type)
+                            || Entity[].class.isAssignableFrom(type)
+                            || Collection.class.isAssignableFrom(type)
+                            || Iterable.class.isAssignableFrom(type)) {
+                        field.setAccessible(true);
+                        discovered.add(field);
+                    }
+                }
+                curr = curr.getSuperclass();
+            }
+            return discovered;
+        });
+
+        for (Field field : fields) {
+            try {
+                Object val = field.get(parent);
+                if (val == null) continue;
+                if (val instanceof Entity singleEntity) {
+                    if (singleEntity != parent && !subParts.contains(singleEntity)) {
+                        subParts.add(singleEntity);
+                    }
+                } else if (val instanceof Entity[] array) {
+                    for (Entity e : array) {
+                        if (e != null && e != parent && !subParts.contains(e)) {
+                            subParts.add(e);
+                        }
+                    }
+                } else if (val instanceof Iterable<?> iterable) {
+                    for (Object item : iterable) {
+                        if (item instanceof Entity e && e != parent && !subParts.contains(e)) {
+                            subParts.add(e);
+                        }
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+        }
+
+        return subParts;
+    }
+
+    /**
+     * Diagnostic helper for /mobmodifier inspect to display discovered reflection fields.
+     */
+    public static List<String> getDiscoveredSubPartFieldInfo(LivingEntity parent) {
+        List<String> info = new ArrayList<>();
+        if (parent == null) return info;
+
+        getAllSubParts(parent); // Ensure cached
+        List<Field> fields = SUB_PART_FIELDS_CACHE.get(parent.getClass());
+        if (fields != null) {
+            for (Field field : fields) {
+                try {
+                    Object val = field.get(parent);
+                    String valDesc = "null";
+                    if (val instanceof Entity e) {
+                        valDesc = e.getClass().getSimpleName() + " [ID: " + e.getId() + "]";
+                    } else if (val instanceof Entity[] arr) {
+                        valDesc = "Entity[" + arr.length + "]";
+                    } else if (val instanceof Collection<?> c) {
+                        valDesc = c.getClass().getSimpleName() + " (size: " + c.size() + ")";
+                    }
+                    info.add(field.getName() + " (" + field.getType().getSimpleName() + ") = " + valDesc);
+                } catch (Exception e) {
+                    info.add(field.getName() + " (Inaccessible)");
+                }
+            }
+        }
+        return info;
+    }
+
+    /**
+     * Enforces that the entity's physical bounding box (AABB) matches its synced Attributes.SCALE value 1:1,
+     * including multi-part entity (PartEntity<?>) sub-hitboxes and their relative dynamic offsets.
+     * Works on both server and client, resolving race conditions where client-side dimensions do not refresh,
+     * where EntityDimensions.fixed(...) ignores scale(), or where GeckoLib/Cerbons API sea monster sub-parts
+     * are reset to 1.0x offsets by mob tick routines.
+     */
+    public static void enforceHitbox(LivingEntity living) {
+        if (living instanceof Player || living.getType() == EntityType.ARMOR_STAND) {
+            return;
+        }
+
+        float scale = living.getScale();
+        List<Entity> subParts = getAllSubParts(living);
+
+        if (Math.abs(scale - 1.0F) <= 0.001F) {
+            // Clean up any tracked multipart offsets when scale returns to vanilla 1.0
+            if (!subParts.isEmpty()) {
+                for (Entity part : subParts) {
+                    if (part != null) {
+                        PartTrackingData tr = PART_TRACKING.remove(part);
+                        if (tr != null && tr.hasScaledPos) {
+                            double unscaledX = living.getX() + tr.lastUnscaledDx;
+                            double unscaledY = living.getY() + tr.lastUnscaledDy;
+                            double unscaledZ = living.getZ() + tr.lastUnscaledDz;
+                            part.setPos(unscaledX, unscaledY, unscaledZ);
+                            part.setBoundingBox(tr.baseDimensions.makeBoundingBox(unscaledX, unscaledY, unscaledZ));
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // Step A: Parent Bounding Box (handling fixed dimensions and elongated single-box sea creatures)
+        EntityDimensions currentDims = living.getDimensions(living.getPose());
+        EntityDimensions defaultDims = living.getType().getDimensions();
+
+        float baseW = currentDims.fixed() ? currentDims.width() : (currentDims.width() / scale);
+        float baseH = currentDims.fixed() ? currentDims.height() : (currentDims.height() / scale);
+        float baseEye = currentDims.fixed() ? currentDims.eyeHeight() : (currentDims.eyeHeight() / scale);
+
+        baseW = Math.max(baseW, defaultDims.width());
+        baseH = Math.max(baseH, defaultDims.height());
+        baseEye = Math.max(baseEye, defaultDims.eyeHeight());
+
+        float expectedW = baseW * scale;
+        float expectedH = baseH * scale;
+        float expectedEye = baseEye * scale;
+
+        // Modest padding for humanoid mobs with outstretched arms (e.g. Drowned, Zombies)
+        if (scale > 1.0f) {
+            String descId = living.getType().getDescriptionId().toLowerCase(Locale.ROOT);
+            if (descId.contains("zombie") || descId.contains("drowned") || descId.contains("husk")
+                    || descId.contains("skeleton") || descId.contains("piglin")) {
+                expectedW *= 1.15f;
+            }
+        }
+
+        double currentAabbW = living.getBoundingBox().getXsize();
+        double currentAabbH = living.getBoundingBox().getYsize();
+        float currentBbW = living.getBbWidth();
+
+        if (Math.abs(currentBbW - expectedW) > 0.02f || Math.abs(currentAabbW - expectedW) > 0.02f || Math.abs(currentAabbH - expectedH) > 0.02f) {
+            living.refreshDimensions();
+
+            EntityDimensions scaledDims = EntityDimensions.scalable(expectedW, expectedH).withEyeHeight(expectedEye);
+            living.setBoundingBox(scaledDims.makeBoundingBox(living.position()));
+        }
+
+        // Step B: Multi-Part Sub-Hitbox & Relative Dynamic Offset Scaling
+        if (!subParts.isEmpty()) {
+            for (Entity part : subParts) {
+                if (part == null || part == living) continue;
+
+                PartTrackingData tracking = PART_TRACKING.get(part);
+                if (tracking == null) {
+                    EntityDimensions pDims = part.getDimensions(part.getPose());
+                    EntityDimensions pDef = part.getType().getDimensions();
+                    float pBaseW = pDims.fixed() ? pDims.width() : (pDims.width() / scale);
+                    float pBaseH = pDims.fixed() ? pDims.height() : (pDims.height() / scale);
+                    float pBaseEye = pDims.fixed() ? pDims.eyeHeight() : (pDims.eyeHeight() / scale);
+
+                    if (pBaseW <= 0.01f) pBaseW = pDef.width();
+                    if (pBaseH <= 0.01f) pBaseH = pDef.height();
+                    if (pBaseEye <= 0.01f) pBaseEye = pDef.eyeHeight();
+
+                    tracking = new PartTrackingData(EntityDimensions.scalable(pBaseW, pBaseH).withEyeHeight(pBaseEye));
+                    PART_TRACKING.put(part, tracking);
+                }
+
+                double curX = part.getX();
+                double curY = part.getY();
+                double curZ = part.getZ();
+
+                boolean mobUpdatedPos = !tracking.hasScaledPos
+                        || Math.abs(curX - tracking.lastScaledX) > 1e-4
+                        || Math.abs(curY - tracking.lastScaledY) > 1e-4
+                        || Math.abs(curZ - tracking.lastScaledZ) > 1e-4;
+
+                double unscaledDx;
+                double unscaledDy;
+                double unscaledDz;
+
+                if (mobUpdatedPos) {
+                    unscaledDx = curX - living.getX();
+                    unscaledDy = curY - living.getY();
+                    unscaledDz = curZ - living.getZ();
+                    tracking.lastUnscaledDx = unscaledDx;
+                    tracking.lastUnscaledDy = unscaledDy;
+                    tracking.lastUnscaledDz = unscaledDz;
+                } else {
+                    unscaledDx = tracking.lastUnscaledDx;
+                    unscaledDy = tracking.lastUnscaledDy;
+                    unscaledDz = tracking.lastUnscaledDz;
+                }
+
+                double scaledX = living.getX() + unscaledDx * scale;
+                double scaledY = living.getY() + unscaledDy * scale;
+                double scaledZ = living.getZ() + unscaledDz * scale;
+
+                part.setPos(scaledX, scaledY, scaledZ);
+
+                EntityDimensions basePartDims = tracking.baseDimensions;
+                EntityDimensions partScaledDims = EntityDimensions.scalable(basePartDims.width() * scale, basePartDims.height() * scale)
+                        .withEyeHeight(basePartDims.eyeHeight() * scale);
+                part.setBoundingBox(partScaledDims.makeBoundingBox(scaledX, scaledY, scaledZ));
+
+                tracking.lastScaledX = scaledX;
+                tracking.lastScaledY = scaledY;
+                tracking.lastScaledZ = scaledZ;
+                tracking.hasScaledPos = true;
+            }
+        }
+
+        // Step C: Scale CerbonsAPI MultipartAwareEntity segments (e.g. Myths of the Sea Leviathan)
+        if (CerbonsApiBridge.isCerbonsMultipart(living)) {
+            CerbonsApiBridge.scaleEntityBounds(living, scale);
         }
     }
 
