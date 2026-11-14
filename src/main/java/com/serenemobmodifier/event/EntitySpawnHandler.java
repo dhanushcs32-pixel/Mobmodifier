@@ -3,11 +3,13 @@ package com.serenemobmodifier.event;
 import com.serenemobmodifier.logic.MobModifierApplier;
 import com.serenemobmodifier.network.NetworkRegistration;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.entity.EntityDimensions;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.neoforge.event.entity.EntityAttributeModificationEvent;
+import net.neoforged.neoforge.event.entity.EntityEvent;
 import net.neoforged.neoforge.event.entity.EntityJoinLevelEvent;
 import net.neoforged.neoforge.event.entity.player.PlayerEvent;
 
@@ -17,6 +19,9 @@ public class EntitySpawnHandler {
         for (EntityType<? extends LivingEntity> type : event.getTypes()) {
             // Players and armor stands are never configurable; don't touch their attribute sets.
             if (type == EntityType.PLAYER || type == EntityType.ARMOR_STAND) continue;
+            if (!event.has(type, Attributes.SCALE)) {
+                event.add(type, Attributes.SCALE, 1.0);
+            }
             if (!event.has(type, Attributes.ATTACK_DAMAGE)) {
                 event.add(type, Attributes.ATTACK_DAMAGE, 2.0);
             }
@@ -28,6 +33,21 @@ public class EntitySpawnHandler {
             }
             if (!event.has(type, Attributes.KNOCKBACK_RESISTANCE)) {
                 event.add(type, Attributes.KNOCKBACK_RESISTANCE, 0.0);
+            }
+        }
+    }
+
+    @SubscribeEvent
+    public static void onEntitySize(EntityEvent.Size event) {
+        if (event.getEntity() instanceof LivingEntity living) {
+            float scale = living.getScale();
+            if (Math.abs(scale - 1.0F) > 0.0001F) {
+                EntityDimensions currentNew = event.getNewSize();
+                EntityDimensions defaultDims = living.getType().getDimensions();
+                // If the dimension was not pre-scaled by getDimensions (e.g. custom mob overriding default dimensions), scale it
+                if (Math.abs(currentNew.width() - defaultDims.width()) < 0.001F && Math.abs(currentNew.height() - defaultDims.height()) < 0.001F) {
+                    event.setNewSize(currentNew.scale(scale));
+                }
             }
         }
     }

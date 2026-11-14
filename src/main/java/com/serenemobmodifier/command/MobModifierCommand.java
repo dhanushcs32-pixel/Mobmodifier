@@ -66,6 +66,13 @@ public class MobModifierCommand {
         if (target.getAttribute(Attributes.SCALE) != null) {
             player.sendSystemMessage(Component.literal(String.format(Locale.ROOT, "§bScale: §f%.2f", target.getAttributeValue(Attributes.SCALE))));
         }
+
+        // Live bounding box dimensions and eye height
+        float bbWidth = target.getBbWidth();
+        float bbHeight = target.getBbHeight();
+        float eyeHeight = target.getEyeHeight();
+        player.sendSystemMessage(Component.literal(String.format(Locale.ROOT, "§bHitbox: §f%.2fw x %.2fh (Eye: %.2f)", bbWidth, bbHeight, eyeHeight)));
+
         if (target.getAttribute(Attributes.FOLLOW_RANGE) != null) {
             player.sendSystemMessage(Component.literal(String.format(Locale.ROOT, "§bFollow Range: §f%.1f", target.getAttributeValue(Attributes.FOLLOW_RANGE))));
         }
@@ -91,7 +98,7 @@ public class MobModifierCommand {
             for (ServerLevel level : source.getServer().getAllLevels()) {
                 for (Entity entity : level.getAllEntities()) {
                     if (entity instanceof LivingEntity living && living.isAlive()) {
-                        if (MobModifierApplier.refreshEntity(living)) {
+                        if (MobModifierApplier.applyMatchingRules(living)) {
                             count++;
                         }
                     }
@@ -99,7 +106,7 @@ public class MobModifierCommand {
             }
         }
         int finalCount = count;
-        source.sendSuccess(() -> Component.literal("§a[SereneMobModifier] Re-applied the current rules to " + finalCount + " active entities. (Edits to the config file are picked up automatically.)"), true);
+        source.sendSuccess(() -> Component.literal("§a[SereneMobModifier] Reloaded rules and refreshed " + finalCount + " active entities."), true);
         return count;
     }
 

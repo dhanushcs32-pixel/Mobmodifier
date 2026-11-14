@@ -5,7 +5,10 @@ import com.serenemobmodifier.config.MobModifierConfig;
 import com.serenemobmodifier.logic.ai.AttackAndBoardShipGoal;
 import net.minecraft.core.Holder;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.network.protocol.game.ClientboundUpdateAttributesPacket;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.util.Mth;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.PathfinderMob;
@@ -20,6 +23,7 @@ import net.minecraft.world.entity.ai.goal.target.NearestAttackableTargetGoal;
 import net.minecraft.world.entity.monster.Enemy;
 import net.minecraft.world.entity.player.Player;
 
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 
@@ -52,10 +56,20 @@ public class MobModifierApplier {
     /**
      * Basic melee behaviour for mobs that were made hostile but have no attack AI of their own (cows, sheep,
      * fish, ...). Without it they would acquire a player as target and then just stand there.
+     * Overrides getAttackReachSqr to properly scale attack reach with the mob's bounding box width.
      */
     public static class SereneMeleeGoal extends MeleeAttackGoal {
         public SereneMeleeGoal(PathfinderMob mob) {
             super(mob, 1.2D, true);
+        }
+
+        @Override
+        protected boolean canPerformAttack(LivingEntity attackTarget) {
+            if (!this.isTimeToAttack()) return false;
+            if (this.mob.isWithinMeleeAttackRange(attackTarget)) return true;
+            double reach = (this.mob.getBbWidth() * 0.5) + (attackTarget.getBbWidth() * 0.5) + 0.8;
+            return this.mob.distanceToSqr(attackTarget) <= (reach * reach)
+                    && this.mob.getSensing().hasLineOfSight(attackTarget);
         }
     }
 
@@ -156,6 +170,10 @@ public class MobModifierApplier {
         removeModifier(entity, Attributes.FOLLOW_RANGE, FOLLOW_MOD_ID);
         removeModifier(entity, Attributes.KNOCKBACK_RESISTANCE, KNOCKBACK_MOD_ID);
 
+        // Force immediate bounding box refresh and sync cleared scale to clients
+        entity.refreshDimensions();
+        syncScaleToTrackingClients(entity);
+
         if (entity.getPersistentData().contains(NBT_HEALTH_INITIALIZED)) {
             entity.getPersistentData().remove(NBT_HEALTH_INITIALIZED);
         }
@@ -183,11 +201,16 @@ public class MobModifierApplier {
         double beforeFollow = getAttrValue(entity, Attributes.FOLLOW_RANGE, 0.0);
         double beforeKb = getAttrValue(entity, Attributes.KNOCKBACK_RESISTANCE, 0.0);
 
-        // 1. Native Minecraft Generic Scale Attribute Modifier
+        // 1. Native Minecraft Generic Scale Attribute Modifier (Clamped to vanilla RangedAttribute limits [0.0625, 16.0])
         AttributeInstance scaleAttr = entity.getAttribute(Attributes.SCALE);
         if (scaleAttr != null && scaleMult > 0.0) {
-            if (Math.abs(scaleMult - 1.0) > 0.0001) {
-                scaleAttr.addOrReplacePermanentModifier(new AttributeModifier(SCALE_MOD_ID, scaleMult - 1.0, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL));
+            double clampedScale = Mth.clamp(scaleMult, 0.0625, 16.0);
+            if (Math.abs(clampedScale - 1.0) > 0.0001) {
+                scaleAttr.addOrReplacePermanentModifier(new AttributeModifier(
+                        SCALE_MOD_ID,
+                        clampedScale - 1.0,
+                        AttributeModifier.Operation.ADD_MULTIPLIED_BASE
+                ));
             } else {
                 scaleAttr.removeModifier(SCALE_MOD_ID);
             }
@@ -260,6 +283,12 @@ public class MobModifierApplier {
             applyGoals(mob, hostileToPlayers, targetBoats, followRange);
         }
 
+        // Force immediate bounding box recalculation (dimensions, eye height, and physical AABB)
+        entity.refreshDimensions();
+
+        // Sync updated scale attribute immediately to all tracking clients
+        syncScaleToTrackingClients(entity);
+
         // Capture stats after modification for verification logging
         double afterHp = entity.getMaxHealth();
         double afterDmg = getAttrValue(entity, Attributes.ATTACK_DAMAGE, 0.0);
@@ -278,6 +307,17 @@ public class MobModifierApplier {
                     formatVal(beforeFollow), formatVal(afterFollow),
                     formatVal(beforeKb), formatVal(afterKb),
                     entity.getUUID());
+        }
+    }
+
+    public static void syncScaleToTrackingClients(LivingEntity entity) {
+        if (entity.level() instanceof ServerLevel serverLevel) {
+            AttributeInstance scaleAttr = entity.getAttribute(Attributes.SCALE);
+            if (scaleAttr != null) {
+                serverLevel.getChunkSource().broadcastAndSend(entity,
+                        new ClientboundUpdateAttributesPacket(entity.getId(), Collections.singleton(scaleAttr))
+                );
+            }
         }
     }
 

@@ -333,17 +333,24 @@ public class AttackAndBoardShipGoal extends Goal {
 
         alignLookAndYaw(dx, dz, distHorizontalSq, new Vec3(this.targetBoat.getX(), this.targetBoat.getY(), this.targetBoat.getZ()));
 
-        if (this.mob.isInWater()) {
-            applyAquaticSwimVelocity(dx, dy, dz, distTotalSq, this.targetBoat.getY() - 0.35);
-        } else {
-            if (this.mob.tickCount % 10 == 0) {
-                this.mob.getNavigation().moveTo(this.targetBoat.getX(), this.targetBoat.getY(), this.targetBoat.getZ(), 1.25);
+        double reach = (this.mob.getBbWidth() * 0.5) + (this.targetBoat.getBbWidth() * 0.5) + 1.2;
+        if (distTotalSq <= (reach * reach)) {
+            if (this.mob.isInWater()) {
+                this.mob.setDeltaMovement(this.mob.getDeltaMovement().scale(0.8));
+            } else {
+                this.mob.getNavigation().stop();
             }
-        }
-
-        double reach = (this.mob.getBbWidth() * 1.5) + (this.targetBoat.getBbWidth() / 2.0) + 0.8;
-        if (distTotalSq <= (reach * reach) && this.attackCooldown <= 0) {
-            performVanillaBoatAttack();
+            if (this.attackCooldown <= 0) {
+                performVanillaBoatAttack();
+            }
+        } else {
+            if (this.mob.isInWater()) {
+                applyAquaticSwimVelocity(dx, dy, dz, distTotalSq, this.targetBoat.getY() - 0.35);
+            } else {
+                if (this.mob.tickCount % 10 == 0) {
+                    this.mob.getNavigation().moveTo(this.targetBoat.getX(), this.targetBoat.getY(), this.targetBoat.getZ(), 1.25);
+                }
+            }
         }
     }
 
@@ -564,25 +571,29 @@ public class AttackAndBoardShipGoal extends Goal {
 
         alignLookAndYaw(dx, dz, distHorizontalSq, hullWorld);
 
-        if (this.mob.isInWater()) {
-            applyAquaticSwimVelocity(dx, dy, dz, distTotalSq, hullWorld.y - 0.2);
-        } else {
-            if (this.mob.tickCount % 10 == 0) {
-                this.mob.getNavigation().moveTo(hullWorld.x, hullWorld.y, hullWorld.z, 1.25);
-            }
-        }
-
-        // Melee reach check (2.5 blocks)
-        double reach = (this.mob.getBbWidth() * 1.5) + 1.3;
+        // Melee reach check scaled with mob bounding box width
+        double reach = (this.mob.getBbWidth() * 0.5) + 1.8;
         double distToHull = this.mob.position().distanceTo(hullWorld);
 
         if (distToHull <= Math.max(reach, 2.5)) {
             this.stage = Stage.ATTACKING_SHIP_HULL;
+            if (this.mob.isInWater()) {
+                this.mob.setDeltaMovement(this.mob.getDeltaMovement().scale(0.8));
+            } else {
+                this.mob.getNavigation().stop();
+            }
             if (this.attackCooldown <= 0) {
                 performShipHullAttack(hullWorld);
             }
         } else {
             this.stage = Stage.APPROACH_SHIP_HULL;
+            if (this.mob.isInWater()) {
+                applyAquaticSwimVelocity(dx, dy, dz, distTotalSq, hullWorld.y - 0.2);
+            } else {
+                if (this.mob.tickCount % 10 == 0) {
+                    this.mob.getNavigation().moveTo(hullWorld.x, hullWorld.y, hullWorld.z, 1.25);
+                }
+            }
         }
     }
 
@@ -609,9 +620,10 @@ public class AttackAndBoardShipGoal extends Goal {
             }
         }
 
-        // Damage any players within close reach of the hull impact
-        AABB impactZone = new AABB(hitPos.x - 2.5, hitPos.y - 2.0, hitPos.z - 2.5,
-                hitPos.x + 2.5, hitPos.y + 2.5, hitPos.z + 2.5);
+        // Damage any players within close reach of the hull impact (scaled with mob width)
+        double impactRadius = Math.max(2.5, this.mob.getBbWidth() * 0.75);
+        AABB impactZone = new AABB(hitPos.x - impactRadius, hitPos.y - 2.0, hitPos.z - impactRadius,
+                hitPos.x + impactRadius, hitPos.y + 2.5, hitPos.z + impactRadius);
         if (this.attackPlayers) {
             List<Player> nearbyPlayers = this.mob.level().getEntitiesOfClass(
                     Player.class, impactZone, EntitySelector.NO_CREATIVE_OR_SPECTATOR);
