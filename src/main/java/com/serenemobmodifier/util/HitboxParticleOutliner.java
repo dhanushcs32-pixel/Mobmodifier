@@ -11,7 +11,7 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.phys.AABB;
-import net.neoforged.neoforge.entity.PartEntity;
+import net.minecraft.world.phys.Vec3;
 
 import java.util.List;
 import java.util.Map;
@@ -21,11 +21,23 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * Visual particle hitbox wireframe outliner.
  * Solves the issue where shader mods like Veil break vanilla's F3 + B hitbox rendering.
- * Renders particle outlines along the 12 edges of an entity's live AABB and all of its PartEntity sub-hitboxes.
+ * Renders particle outlines along the edges of an entity's live hitbox and all sub-hitboxes.
+ * For CerbonsAPI multipart entities (e.g. Leviathan), renders 3D oriented segment wireframes
+ * (head in white END_ROD, body in orange FLAME) and avoids rendering the outer broad-phase box.
  */
 public class HitboxParticleOutliner {
 
     private static final Map<UUID, Integer> OUTLINE_TICKS = new ConcurrentHashMap<>();
+
+    // 12 edges connecting 8 binary-indexed corners
+    private static final int[][] EDGES = {
+            // Edges along Z (bit 0 toggles)
+            {0, 1}, {2, 3}, {4, 5}, {6, 7},
+            // Edges along Y (bit 1 toggles)
+            {0, 2}, {1, 3}, {4, 6}, {5, 7},
+            // Edges along X (bit 2 toggles)
+            {0, 4}, {1, 5}, {2, 6}, {3, 7}
+    };
 
     public static void startOutline(Entity entity, int ticks) {
         if (entity != null) {
@@ -56,6 +68,31 @@ public class HitboxParticleOutliner {
 
         // Render every 2 ticks to give a crisp, continuous wireframe without particle lag
         if (ticksLeft % 2 == 0) {
+            // Case 1: CerbonsAPI Multipart Entities (Leviathan, Kraken, Abaia, etc.)
+            if (CerbonsApiBridge.isCerbonsMultipart(living)) {
+                List<CerbonsApiBridge.CerbonsSegment> segments = CerbonsApiBridge.getSegments(living);
+                if (!segments.isEmpty()) {
+                    for (CerbonsApiBridge.CerbonsSegment seg : segments) {
+                        ParticleOptions particle = seg.isHead() ? ParticleTypes.END_ROD : ParticleTypes.FLAME;
+                        renderOrientedBoxOutline(serverLevel, seg.corners(), particle, 0.4);
+                    }
+                    return;
+                }
+            }
+
+            // Case 2: Serene IK Spine Segments (elongated sea monsters, serpents, leviathans)
+            List<SereneBodyPartEntity> spineSegs = SpineSegmentManager.getSegments(living);
+            if (!spineSegs.isEmpty()) {
+                for (SereneBodyPartEntity seg : spineSegs) {
+                    if (seg != null) {
+                        ParticleOptions particle = seg.isHead ? ParticleTypes.END_ROD : ParticleTypes.FLAME;
+                        renderBoxOutline(serverLevel, seg.getBoundingBox(), particle, 0.4);
+                    }
+                }
+                return;
+            }
+
+            // Case 3: Standard LivingEntity and Multi-Part entities
             // Render parent bounding box with glowing END_ROD particles
             renderBoxOutline(serverLevel, living.getBoundingBox(), ParticleTypes.END_ROD, 0.4);
 
@@ -66,22 +103,15 @@ public class HitboxParticleOutliner {
                     renderBoxOutline(serverLevel, part.getBoundingBox(), ParticleTypes.FLAME, 0.4);
                 }
             }
+        }
+    }
 
-            // Render CerbonsAPI segment boxes (e.g. Myths of the Sea Leviathan body segments)
-            List<AABB> cerbonsBoxes = CerbonsApiBridge.getCerbonsPartBoxes(living);
-            for (AABB box : cerbonsBoxes) {
-                if (box != null) {
-                    renderBoxOutline(serverLevel, box, ParticleTypes.FLAME, 0.4);
-                }
-            }
-
-            // Render Serene IK spine segments if active
-            List<SereneBodyPartEntity> spineSegs = SpineSegmentManager.getSegments(living);
-            for (SereneBodyPartEntity seg : spineSegs) {
-                if (seg != null) {
-                    renderBoxOutline(serverLevel, seg.getBoundingBox(), ParticleTypes.FLAME, 0.4);
-                }
-            }
+    public static void renderOrientedBoxOutline(ServerLevel level, Vec3[] corners, ParticleOptions particle, double step) {
+        if (corners == null || corners.length < 8) return;
+        for (int[] edge : EDGES) {
+            Vec3 p1 = corners[edge[0]];
+            Vec3 p2 = corners[edge[1]];
+            renderLine(level, p1.x, p2.x, p1.y, p2.y, p1.z, p2.z, step, particle);
         }
     }
 
@@ -116,20 +146,29 @@ public class HitboxParticleOutliner {
         double dx = x2 - x1;
         double dy = y2 - y1;
         double dz = z2 - z1;
-        double len = Math.sqrt(dx * dx + dy * dy + dz * dz);
-        if (len < 0.001) return;
+        double dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
 
-        int steps = (int) Math.max(1, Math.ceil(len / step));
-        List<ServerPlayer> players = level.players();
+        if (dist <= 0.001) {
+            spawnParticle(level, particle, x1, y1, z1);
+            return;
+        }
+
+        int steps = Math.max(1, (int) Math.ceil(dist / step));
         for (int i = 0; i <= steps; i++) {
-            double t = (double) i / steps;
-            double px = x1 + dx * t;
-            double py = y1 + dy * t;
-            double pz = z1 + dz * t;
-            for (ServerPlayer player : players) {
-                level.sendParticles(player, particle, true, px, py, pz, 1, 0.0, 0.0, 0.0, 0.0);
+            double fraction = (double) i / steps;
+            double px = x1 + dx * fraction;
+            double py = y1 + dy * fraction;
+            double pz = z1 + dz * fraction;
+            spawnParticle(level, particle, px, py, pz);
+        }
+    }
+
+    private static void spawnParticle(ServerLevel level, ParticleOptions particle, double x, double y, double z) {
+        // Broadcast within 128 blocks
+        for (ServerPlayer player : level.players()) {
+            if (player.distanceToSqr(x, y, z) < 128.0 * 128.0) {
+                level.sendParticles(player, particle, true, x, y, z, 1, 0, 0, 0, 0);
             }
         }
     }
 }
-

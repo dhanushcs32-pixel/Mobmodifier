@@ -152,8 +152,9 @@ public class MobModifierCommand {
                 SereneBodyPartEntity seg = spineSegs.get(i);
                 AABB segBox = seg.getBoundingBox();
                 player.sendSystemMessage(Component.literal(String.format(Locale.ROOT,
-                        "  §7[Spine #%d]: §f%.2fw x %.2fh x %.2fd §7(Pos: %.1f, %.1f, %.1f)",
-                        i, segBox.getXsize(), segBox.getYsize(), segBox.getZsize(),
+                        "  §7[Spine #%d - %s%s§7]: §f%.2fw x %.2fh x %.2fd §7(Pos: %.1f, %.1f, %.1f)",
+                        i, seg.isHead ? "§aHead: " : "§e", seg.segmentName,
+                        segBox.getXsize(), segBox.getYsize(), segBox.getZsize(),
                         seg.getX(), seg.getY(), seg.getZ()
                 )));
             }
@@ -260,52 +261,12 @@ public class MobModifierCommand {
             if (distSqToPlayer > (maxDist + 16.0) * (maxDist + 16.0)) continue;
 
             if (entity instanceof LivingEntity living) {
-                // Test main bounding box
-                AABB box = living.getBoundingBox().inflate(0.5);
-                Optional<Vec3> clip = box.clip(eyePos, reachVec);
-                if (clip.isPresent()) {
-                    double hitDistSq = eyePos.distanceToSqr(clip.get());
-                    if (hitDistSq < closestHitDistSq) {
-                        closestHitDistSq = hitDistSq;
-                        bestHitEntity = living;
-                    }
-                }
-
-                // Test any child sub-parts (whether PartEntity or reflected segments)
-                List<Entity> parts = MobModifierApplier.getAllSubParts(living);
-                for (Entity part : parts) {
-                    if (part != null && part != living) {
-                        AABB partBox = part.getBoundingBox().inflate(0.5);
-                        Optional<Vec3> partClip = partBox.clip(eyePos, reachVec);
-                        if (partClip.isPresent()) {
-                            double hitDistSq = eyePos.distanceToSqr(partClip.get());
-                            if (hitDistSq < closestHitDistSq) {
-                                closestHitDistSq = hitDistSq;
-                                bestHitEntity = living;
-                            }
-                        }
-                    }
-                }
-
-                // Test CerbonsAPI scaled segment boxes if present
-                for (AABB cerbonBox : CerbonsApiBridge.getCerbonsPartBoxes(living)) {
-                    AABB inflated = cerbonBox.inflate(0.5);
-                    Optional<Vec3> cerbonClip = inflated.clip(eyePos, reachVec);
-                    if (cerbonClip.isPresent()) {
-                        double hitDistSq = eyePos.distanceToSqr(cerbonClip.get());
-                        if (hitDistSq < closestHitDistSq) {
-                            closestHitDistSq = hitDistSq;
-                            bestHitEntity = living;
-                        }
-                    }
-                }
-
-                // Test Serene IK spine segments if present
-                for (SereneBodyPartEntity segment : SpineSegmentManager.getSegments(living)) {
-                    AABB segBox = segment.getBoundingBox().inflate(0.5);
-                    Optional<Vec3> segClip = segBox.clip(eyePos, reachVec);
-                    if (segClip.isPresent()) {
-                        double hitDistSq = eyePos.distanceToSqr(segClip.get());
+                // Test all active world-space hitbox segments (CerbonsAPI, Spine, Sub-Parts, or main AABB)
+                for (AABB segBox : MobModifierApplier.getActiveHitboxSegments(living)) {
+                    AABB inflated = segBox.inflate(0.5);
+                    Optional<Vec3> clip = inflated.clip(eyePos, reachVec);
+                    if (clip.isPresent()) {
+                        double hitDistSq = eyePos.distanceToSqr(clip.get());
                         if (hitDistSq < closestHitDistSq) {
                             closestHitDistSq = hitDistSq;
                             bestHitEntity = living;

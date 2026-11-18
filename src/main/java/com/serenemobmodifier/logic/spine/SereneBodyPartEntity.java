@@ -16,13 +16,19 @@ import net.neoforged.neoforge.entity.PartEntity;
 public class SereneBodyPartEntity extends PartEntity<LivingEntity> {
 
     public final String segmentName;
+    public final boolean isHead;
     private EntityDimensions dimensions;
 
-    public SereneBodyPartEntity(LivingEntity parent, String segmentName, float width, float height) {
+    public SereneBodyPartEntity(LivingEntity parent, String segmentName, float width, float height, boolean isHead) {
         super(parent);
         this.segmentName = segmentName;
+        this.isHead = isHead;
         this.dimensions = EntityDimensions.scalable(width, height);
         this.refreshDimensions();
+    }
+
+    public SereneBodyPartEntity(LivingEntity parent, String segmentName, float width, float height) {
+        this(parent, segmentName, width, height, false);
     }
 
     @Override

@@ -28,6 +28,7 @@ import net.minecraft.world.entity.ai.goal.WrappedGoal;
 import net.minecraft.world.entity.ai.goal.target.NearestAttackableTargetGoal;
 import net.minecraft.world.entity.monster.Enemy;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.phys.AABB;
 import net.neoforged.neoforge.entity.PartEntity;
 
 import java.lang.reflect.Field;
@@ -37,10 +38,69 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class MobModifierApplier {
+
+    private static final Set<LivingEntity> TRACKED_SCALED_ENTITIES = Collections.newSetFromMap(new WeakHashMap<>());
+
+    public static void trackScaledEntity(LivingEntity entity) {
+        if (entity != null && entity.isAlive()) {
+            TRACKED_SCALED_ENTITIES.add(entity);
+        }
+    }
+
+    public static Set<LivingEntity> getTrackedScaledEntities() {
+        return TRACKED_SCALED_ENTITIES;
+    }
+
+    /**
+     * Single shared source of truth for all active world-space hitbox segment AABBs.
+     * Used by HitboxParticleOutliner, MobModifierCommand, Projectile Sweep, and Player Melee Attack.
+     */
+    public static List<AABB> getActiveHitboxSegments(LivingEntity entity) {
+        if (entity == null) return Collections.emptyList();
+
+        // 1. CerbonsAPI Multipart Entities (Leviathan, Kraken, Abaia, etc.)
+        if (CerbonsApiBridge.isCerbonsMultipart(entity)) {
+            List<AABB> cerbonBoxes = CerbonsApiBridge.getCerbonsPartBoxes(entity);
+            if (!cerbonBoxes.isEmpty()) {
+                return cerbonBoxes;
+            }
+        }
+
+        // 2. Serene IK Spine Segments
+        List<SereneBodyPartEntity> spineSegs = SpineSegmentManager.getSegments(entity);
+        if (!spineSegs.isEmpty()) {
+            List<AABB> boxes = new ArrayList<>(spineSegs.size());
+            for (SereneBodyPartEntity seg : spineSegs) {
+                if (seg != null) {
+                    boxes.add(seg.getBoundingBox());
+                }
+            }
+            return boxes;
+        }
+
+        // 3. Multi-Part Sub-Parts
+        List<Entity> subParts = getAllSubParts(entity);
+        if (!subParts.isEmpty()) {
+            List<AABB> boxes = new ArrayList<>(subParts.size());
+            for (Entity part : subParts) {
+                if (part != null && part != entity) {
+                    boxes.add(part.getBoundingBox());
+                }
+            }
+            if (!boxes.isEmpty()) {
+                return boxes;
+            }
+        }
+
+        // 4. Fallback to main bounding box
+        AABB bb = entity.getBoundingBox();
+        return bb != null ? List.of(bb) : Collections.emptyList();
+    }
 
     public static final ResourceLocation SCALE_MOD_ID = ResourceLocation.fromNamespaceAndPath(SereneMobModifier.MOD_ID, "scale");
     public static final ResourceLocation HEALTH_MOD_ID = ResourceLocation.fromNamespaceAndPath(SereneMobModifier.MOD_ID, "health");
@@ -463,6 +523,15 @@ public class MobModifierApplier {
             return;
         }
 
+        // If entity is managed by CerbonsAPI (e.g. Leviathan, Kraken), DO NOT touch or overwrite its bounding box!
+        if (CerbonsApiBridge.isCerbonsMultipart(living)
+                || (living.getBoundingBox() != null && living.getBoundingBox().getClass().getSimpleName().contains("CompoundOrientedBox"))) {
+            float scale = living.getScale();
+            CerbonsApiBridge.scaleEntityBounds(living, scale);
+            trackScaledEntity(living);
+            return;
+        }
+
         float scale = living.getScale();
         List<Entity> subParts = getAllSubParts(living);
 
@@ -589,6 +658,10 @@ public class MobModifierApplier {
         // Step C: Scale CerbonsAPI MultipartAwareEntity segments (e.g. Myths of the Sea Leviathan)
         if (CerbonsApiBridge.isCerbonsMultipart(living)) {
             CerbonsApiBridge.scaleEntityBounds(living, scale);
+        }
+
+        if (!subParts.isEmpty() || SpineSegmentManager.hasSpineSegments(living) || Math.abs(scale - 1.0F) > 0.01F) {
+            trackScaledEntity(living);
         }
     }
 
